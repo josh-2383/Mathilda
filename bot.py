@@ -13,6 +13,33 @@ import json
 import random
 import openai
 import os
+import os
+import discord
+import os
+
+model_path = "/home/runner/workspace/vosk-model-small-en-us-0.15"
+
+if not os.path.exists(model_path):
+    print(f"ERROR: Model path '{model_path}' does not exist. Check if it's uploaded correctly.")
+else:
+    print("Model folder found. Proceeding with Vosk initialization.")
+    
+token = os.getenv("TOKEN")  # Ensure this is correct
+if token is None:
+    print("Error: TOKEN environment variable is not set")
+    exit(1)
+
+intents = discord.Intents.default()
+intents.typing = False  
+intents.presences = False  
+
+client = discord.Client(intents=intents)
+
+@client.event
+async def on_ready():
+    print(f'Logged in as {client.user}')
+
+client.run(token)
 from flask import Flask  
 from threading import Thread  
 
