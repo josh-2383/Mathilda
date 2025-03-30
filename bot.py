@@ -18,7 +18,21 @@ import discord
 import os
 import os
 import vosk
+import os
+from flask import Flask
 
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Mathilda bot is running!"
+
+# Get the port from the environment, default to 8080
+port = int(os.environ.get("PORT", 8080))
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=port)
+    
 model_path = os.path.join(os.getcwd(), "vosk-model-small-en-us-0.15")
 if not os.path.exists(model_path):
     print(f"ERROR: Model path '{model_path}' does not exist. Check if it's uploaded correctly.")
