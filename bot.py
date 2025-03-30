@@ -16,6 +16,16 @@ import os
 import os
 import discord
 import os
+import os
+import vosk
+
+model_path = os.path.join(os.getcwd(), "vosk-model-small-en-us-0.15")
+if not os.path.exists(model_path):
+    print(f"ERROR: Model path '{model_path}' does not exist. Check if it's uploaded correctly.")
+else:
+    print("Model folder found. Proceeding with Vosk initialization.")
+
+vosk_model = vosk.Model(model_path)
 
 model_path = "/home/runner/workspace/vosk-model-small-en-us-0.15"
 
