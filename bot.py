@@ -19,7 +19,20 @@ import os
 import os
 import vosk
 import os
+import os
+print("✅ Bot is starting...")  # Debug log
+
+# Check environment variables
+TOKEN = os.getenv("TOKEN")
+if not TOKEN:
+    print("❌ ERROR: Discord bot token is missing!")
+    exit(1)
+
+print("✅ Token found, proceeding...")  # Debug log
+
 from flask import Flask
+
+print("Mathilda is starting...")
 
 app = Flask(__name__)
 
