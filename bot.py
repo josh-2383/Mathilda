@@ -21,7 +21,42 @@ import vosk
 import os
 import os
 import discord
+from flask import Flask
+import threading
 
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Mathilda is running!"
+
+def run_flask():
+    app.run(host="0.0.0.0", port=8080)  # Render requires this
+
+if __name__ == "__main__":
+    threading.Thread(target=run_flask).start()  # Start Flask in the background
+
+    import discord
+    import os
+
+    print("✅ Bot is starting...")
+
+    TOKEN = os.getenv("TOKEN")
+    if not TOKEN:
+        print("❌ ERROR: Discord bot token is missing!")
+        exit(1)
+
+    print("✅ Token found, proceeding...")
+
+    intents = discord.Intents.default()
+    client = discord.Client(intents=intents)
+
+    @client.event
+    async def on_ready():
+        print(f"🚀 Mathilda is online! Logged in as {client.user}")
+
+    client.run(TOKEN)
+    
 print("✅ Bot is starting...")  # Debug log
 
 TOKEN = os.getenv("TOKEN")
