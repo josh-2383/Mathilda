@@ -114,14 +114,14 @@ color=Color.blue()
 )
 await message.channel.send(embed=embed)
 
- except Exception as e:
-        # ✅ `except` block correctly aligned
+except Exception as e:
+        # This 'except' block should be at the same level as the 'try' block
         error_embed = create_embed(
             title="❌ Error",
             description=f"Couldn't solve: {str(e)}",
             color=Color.red()
         )
-        await message.channel.send(embed=error_embed)  # ✅ Awaits properly
+        await message.channel.send(embed=error_embed)  # Await properly inside except block
 
 # Bot Ready Event
 @bot.event
