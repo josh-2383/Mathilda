@@ -18,7 +18,7 @@ def home():
     return "Mathilda is running!"
 
 def run_flask():
-app.run(host="0.0.0.0", port=8080)
+    app.run(host="0.0.0.0", port=8080)
 
 threading.Thread(target=run_flask, daemon=True).start()
 
