@@ -9,6 +9,34 @@ from flask import Flask
 import threading
 from discord import Embed, Color
 import asyncio
+import pytesseract
+import cv2
+import numpy as np
+from PIL import Image
+import io
+import requests
+
+def extract_text_from_image(image_url):
+    """Extract text from an image URL using OCR"""
+    try:
+        # Download the image
+        response = requests.get(image_url)
+        img = Image.open(io.BytesIO(response.content))
+        
+        # Convert to OpenCV format (for preprocessing)
+        img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        
+        # Preprocess image (grayscale + thresholding)
+        gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+        _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
+        
+        # Run OCR
+        custom_config = r'--oem 3 --psm 6 -l eng+equ'  # Optimize for math equations
+        text = pytesseract.image_to_string(thresh, config=custom_config)
+        
+        return text.strip()
+    except Exception as e:
+        return f"❌ OCR Error: {str(e)}"
 
 # Flask Setup for Uptime
 app = Flask(__name__)
@@ -118,6 +146,35 @@ async def on_ready():
     print(f"🚀 Mathilda is online! Logged in as {bot.user}")
 
 @bot.command()
+async def ocr(ctx, image_url: str = None):
+    """Extract and solve math problems from images"""
+    if not image_url and not ctx.message.attachments:
+        await ctx.send("🚨 Please attach an image or provide a URL!")
+        return
+    
+    # Get image URL from attachment (if no URL provided)
+    if not image_url:
+        image_url = ctx.message.attachments[0].url
+    
+    # Show "processing" message
+    processing_msg = await ctx.send("🔍 Processing image...")
+    
+    # Extract text
+    extracted_text = extract_text_from_image(image_url)
+    
+    if extracted_text.startswith("❌"):
+        await processing_msg.edit(content=extracted_text)
+        return
+    
+    # Send extracted text (optional)
+    await processing_msg.edit(content=f"📝 Extracted text:\n```{extracted_text}```")
+    
+    # Auto-solve if it looks like math
+    if any(c in extracted_text for c in ['+', '-', '=', 'x', '÷', '^']):
+        await solve(ctx, problem=extracted_text)  # Reuse your existing !solve command
+        
+
+@bot.command()
 async def mathquest(ctx):
     """Start a math question streak challenge"""
     try:
@@ -145,10 +202,18 @@ async def mathquest(ctx):
         )
         await ctx.send(embed=error_embed)
 
-@bot.event
 async def on_message(message):
     if message.author.bot:
         return await bot.process_commands(message)
+    
+    # Check for image attachments
+    if message.attachments and any(att.filename.lower().endswith(('.png', '.jpg', '.jpeg')) for att in message.attachments):
+        ctx = await bot.get_context(message)
+        await ocr(ctx)  # Trigger OCR command automatically
+        return
+    
+    # Your existing on_message logic here...
+    await bot.process_commands(message)
 
     user_id = message.author.id
     content = message.content.lower().strip()
