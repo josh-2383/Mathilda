@@ -122,7 +122,7 @@ async def solve_math_question(message):
 # Bot Ready Event
 @bot.event
 async def on_ready():
-    print(f"🚀 Mathilda is online! Logged in as {bot.user}")
+      print(f"🚀 Mathilda is online! Logged in as {bot.user}")
     
 # Math Quest Command
 @bot.command()
