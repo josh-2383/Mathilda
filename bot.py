@@ -99,22 +99,17 @@ async def solve_math_question(message):
             temperature=0.5
         )
 
-        answer = response.choices[0].message.content
-        return answer  # Make sure to return or use it properly
+        answer = response.choices[0].message.content  # Properly indented
+
+        # Embed message properly formatted
+        embed = create_embed(
+            title=f"Solution for: {message.content[:100]}",
+            description=answer,
+            color=Color.blue()
+        )
+        await message.channel.send(embed=embed)  # Await properly inside try block
 
     except Exception as e:
-        print(f"Error in solve_math_question: {e}")
-        return "Sorry, I couldn't solve that right now."
-
-
-embed = create_embed(
-title=f"Solution for: {message.content[:100]}",
-description=answer,
-color=Color.blue()
-)
-await message.channel.send(embed=embed)
-
-except Exception as e:
         # This 'except' block should be at the same level as the 'try' block
         error_embed = create_embed(
             title="❌ Error",
