@@ -124,7 +124,6 @@ async def solve_math_question(message):
 async def on_ready():
       print(f"🚀 Mathilda is online! Logged in as {bot.user}")
     
-# Math Quest Command
 @bot.command()
 async def mathquest(ctx):
     """Start a math question streak challenge"""
@@ -132,31 +131,111 @@ async def mathquest(ctx):
         user_id = ctx.author.id
         question, correct_answer = random.choice(list(math_questions.items()))
 
-bot.math_answers[user_id] = {
-"answer": correct_answer,
-"question": question,
-"streak": bot.question_streaks.get(user_id, 0)
-}
+        bot.math_answers[user_id] = {
+            "answer": correct_answer,
+            "question": question,
+            "streak": bot.question_streaks.get(user_id, 0)
+        }
 
-embed = create_embed(
-title=f"🧮 Math Challenge (Streak: {bot.question_streaks.get(user_id, 0)})",
-description=question,
-color=Color.green(),
-footer="Type your answer in chat!"
-)
-await ctx.send(embed=embed)
-except Exception as e:
-error_embed = create_embed(
-title="❌ Error",
-description=f"An error occurred: {str(e)}",
-color=Color.red()
-)
-await ctx.send(embed=error_embed)
+        embed = create_embed(
+            title=f"🧮 Math Challenge (Streak: {bot.question_streaks.get(user_id, 0)})",
+            description=question,
+            color=Color.green(),
+            footer="Type your answer in chat!"
+        )
+        await ctx.send(embed=embed)
+    except Exception as e:
+        error_embed = create_embed(
+            title="❌ Error",
+            description=f"An error occurred: {str(e)}",
+            color=Color.red()
+        )
+        await ctx.send(embed=error_embed)
 
 @bot.event
 async def on_message(message):
-if message.author.bot:
-return await bot.process_commands(message)
+    if message.author.bot:
+        return await bot.process_commands(message)
+
+    user_id = message.author.id
+    content = message.content  # This defines 'content' for the handler
+
+    if user_id in bot.math_answers:
+        question_data = bot.math_answers[user_id]
+        correct_answer = question_data["answer"]
+        current_streak = question_data["streak"]
+
+        # Compare the raw message content without case sensitivity
+        if message.content.strip().lower() == correct_answer.lower():
+            current_streak += 1
+            bot.question_streaks[user_id] = current_streak
+            points = 10 + (current_streak * 2)
+
+            cursor.execute("""
+            INSERT INTO leaderboard (user_id, points)
+            VALUES (?, ?)
+            ON CONFLICT(user_id)
+            DO UPDATE SET points = points + ?
+            """, (user_id, points, points))
+            conn.commit()
+
+            new_question, new_answer = random.choice(list(math_questions.items()))
+            bot.math_answers[user_id] = {
+                "answer": new_answer,
+                "question": new_question,
+                "streak": current_streak
+            }
+
+            embed = create_embed(
+                title=f"✅ Correct! (Streak: {current_streak})",
+                description=f"You earned {points} points!\n\nNext question: {new_question}",
+                color=Color.green()
+            )
+            await message.channel.send(embed=embed)
+        else:
+            lost_points = min(5, current_streak * 5)
+            cursor.execute("""
+            INSERT INTO leaderboard (user_id, points)
+            VALUES (?, ?)
+            ON CONFLICT(user_id)
+            DO UPDATE SET points = points - ?
+            """, (user_id, -lost_points, lost_points))
+            conn.commit()
+
+            embed = create_embed(
+                title="❌ Incorrect!",
+                description=f"Streak ended! Correct answer was: `{correct_answer}`\nLost {lost_points} points.",
+                color=Color.red(),
+                fields=[("Continue", "Type `!mathquest` to restart", False)]
+            )
+            await message.channel.send(embed=embed)
+            del bot.math_answers[user_id]
+            if user_id in bot.question_streaks:
+                del bot.question_streaks[user_id]
+            return  # This prevents double-processing
+
+    # Handle Conversational Math Help
+    if user_id in bot.conversation_states and bot.conversation_states[user_id] == "math_help":
+        if any(word in content for word in ["cancel", "stop", "done"]):
+            del bot.conversation_states[user_id]
+            await message.channel.send("Exited math help mode. Your streaks are preserved!")
+            return
+        else:
+            await solve_math_question(message)
+            return
+
+    # Detect Math Help Requests
+    if any(trigger in content for trigger in bot.math_help_triggers):
+        bot.conversation_states[user_id] = "math_help"
+        embed = create_embed(
+            title="🧮 Math Help Activated",
+            description="Now in math help mode! Just type problems like:\n- `2+2`\n- `Solve 3x=9`\n- `Factor x²-4`\n\nSay 'cancel' when done.",
+            color=Color.blue()
+        )
+        await message.channel.send(embed=embed)
+        return
+
+    await bot.process_commands(message)
 
 user_id = message.author.id
 content = message.content # This defines 'content' for the handler
