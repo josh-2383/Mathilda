@@ -152,6 +152,7 @@ async def mathquest(ctx):
         )
         await ctx.send(embed=error_embed)
 
+
 @bot.event
 async def on_message(message):
     if message.author.bot:
