@@ -73,7 +73,7 @@ math_questions = {
 
 # Helper function for creating embeds
 def create_embed(title=None, description=None, color=Color.blue(), fields=None, footer=None):
-embed = Embed(title=title, description=description, color=color)
+    embed = Embed(title=title, description=description, color=color)
 if fields:
 for name, value, inline in fields:
 embed.add_field(name=name, value=value, inline=inline)
