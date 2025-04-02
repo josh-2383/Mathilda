@@ -303,7 +303,7 @@ if any(word in content for word in ["cancel", "stop", "done"]):  # Checking for 
     await message.channel.send("Exited math help mode. Your streaks are preserved!")  # Notify the user
     return  # Exit the function after canceling math help
 else:
-await solve_math_question(message)
+    await solve_math_question(message)  # Indented properly under the 'else' block
 return
 
 # Detect Math Help Requests
