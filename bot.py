@@ -87,20 +87,25 @@ async def solve_math_question(message):
         import openai
         client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[{
+                "role": "system",
+                "content": "You are a helpful math tutor. Explain solutions step-by-step."
+            }, {
+                "role": "user",
+                "content": message.content
+            }],
+            temperature=0.5
+        )
 
-response = client.chat.completions.create(
-model="gpt-3.5-turbo",
-messages=[{
-"role": "system",
-"content": "You are a helpful math tutor. Explain solutions step-by-step."
-},{
-"role": "user",
-"content": message.content
-}],
-temperature=0.5
-)
+        answer = response.choices[0].message.content
+        return answer  # Make sure to return or use it properly
 
-answer = response.choices[0].message.content
+    except Exception as e:
+        print(f"Error in solve_math_question: {e}")
+        return "Sorry, I couldn't solve that right now."
+
 
 embed = create_embed(
 title=f"Solution for: {message.content[:100]}",
