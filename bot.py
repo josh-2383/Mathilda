@@ -246,33 +246,33 @@ if user_id in bot.math_answers:
     correct_answer = question_data["answer"]
     current_streak = question_data["streak"]
 
-# Compare the raw message content without case sensitivity
+# Handle Math Answer Check in on_message
 if message.content.strip().lower() == correct_answer.lower():
-current_streak += 1
-bot.question_streaks[user_id] = current_streak
-points = 10 + (current_streak * 2)
+    current_streak += 1  # This should be indented
+    bot.question_streaks[user_id] = current_streak
+    points = 10 + (current_streak * 2)
 
-cursor.execute("""
-INSERT INTO leaderboard (user_id, points)
-VALUES (?, ?)
-ON CONFLICT(user_id)
-DO UPDATE SET points = points + ?
-""", (user_id, points, points))
-conn.commit()
+    cursor.execute("""
+    INSERT INTO leaderboard (user_id, points)
+    VALUES (?, ?)
+    ON CONFLICT(user_id)
+    DO UPDATE SET points = points + ?
+    """, (user_id, points, points))
+    conn.commit()
 
-new_question, new_answer = random.choice(list(math_questions.items()))
-bot.math_answers[user_id] = {
-"answer": new_answer,
-"question": new_question,
-"streak": current_streak
-}
+    new_question, new_answer = random.choice(list(math_questions.items()))
+    bot.math_answers[user_id] = {
+        "answer": new_answer,
+        "question": new_question,
+        "streak": current_streak
+    }
 
-embed = create_embed(
-title=f"✅ Correct! (Streak: {current_streak})",
-description=f"You earned {points} points!\n\nNext question: {new_question}",
-color=Color.green()
-)
-await message.channel.send(embed=embed)
+    embed = create_embed(
+        title=f"✅ Correct! (Streak: {current_streak})",
+        description=f"You earned {points} points!\n\nNext question: {new_question}",
+        color=Color.green()
+    )
+    await message.channel.send(embed=embed)
 else:
 lost_points = min(5, current_streak * 5)
 cursor.execute("""
