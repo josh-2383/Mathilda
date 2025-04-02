@@ -274,26 +274,27 @@ if message.content.strip().lower() == correct_answer.lower():
     )
     await message.channel.send(embed=embed)
 else:
-lost_points = min(5, current_streak * 5)
-cursor.execute("""
-INSERT INTO leaderboard (user_id, points)
-VALUES (?, ?)
-ON CONFLICT(user_id)
-DO UPDATE SET points = points - ?
-""", (user_id, -lost_points, lost_points))
-conn.commit()
+    lost_points = min(5, current_streak * 5)  # This should be indented under 'else'
+    cursor.execute("""
+    INSERT INTO leaderboard (user_id, points)
+    VALUES (?, ?)
+    ON CONFLICT(user_id)
+    DO UPDATE SET points = points - ?
+    """, (user_id, -lost_points, lost_points))
+    conn.commit()
 
-embed = create_embed(
-title="❌ Incorrect!",
-description=f"Streak ended! Correct answer was: `{correct_answer}`\nLost {lost_points} points.",
-color=Color.red(),
-fields=[("Continue", "Type `!mathquest` to restart", False)]
-)
-await message.channel.send(embed=embed)
-del bot.math_answers[user_id]
-if user_id in bot.question_streaks:
-del bot.question_streaks[user_id]
-return # This prevents double-processing
+    embed = create_embed(
+        title="❌ Incorrect!",
+        description=f"Streak ended! Correct answer was: `{correct_answer}`\nLost {lost_points} points.",
+        color=Color.red(),
+        fields=[("Continue", "Type `!mathquest` to restart", False)]
+    )
+    await message.channel.send(embed=embed)
+    del bot.math_answers[user_id]
+    if user_id in bot.question_streaks:
+        del bot.question_streaks[user_id]
+    return  # This prevents double-processing
+
 
 
 # Handle Conversational Math Help
