@@ -74,18 +74,18 @@ math_questions = {
 # Helper function for creating embeds
 def create_embed(title=None, description=None, color=Color.blue(), fields=None, footer=None):
     embed = Embed(title=title, description=description, color=color)
-if fields:
-   for name, value, inline in fields:
-embed.add_field(name=name, value=value, inline=inline)
-if footer:
-embed.set_footer(text=footer)
-return embed
+    if fields:
+        for name, value, inline in fields:
+            embed.add_field(name=name, value=value, inline=inline)
+    if footer:
+        embed.set_footer(text=footer)
+    return embed
 
 async def solve_math_question(message):
-"""Handles conversational math problem solving"""
-try:
-import openai
-client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    """Handles conversational math problem solving"""
+    try:
+        import openai
+        client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 
 response = client.chat.completions.create(
@@ -125,10 +125,10 @@ print(f"🚀 Mathilda is online! Logged in as {bot.user}")
 # Math Quest Command
 @bot.command()
 async def mathquest(ctx):
-"""Start a math question streak challenge"""
-try:
-user_id = ctx.author.id
-question, correct_answer = random.choice(list(math_questions.items())
+    """Start a math question streak challenge"""
+    try:
+        user_id = ctx.author.id
+        question, correct_answer = random.choice(list(math_questions.items()))
 
 bot.math_answers[user_id] = {
 "answer": correct_answer,
@@ -159,11 +159,10 @@ return await bot.process_commands(message)
 user_id = message.author.id
 content = message.content # This defines 'content' for the handler
 
-# Handle Math Quest Streak System
 if user_id in bot.math_answers:
-question_data = bot.math_answers[user_id]
-correct_answer = question_data["answer"]
-current_streak = question_data["streak"]
+    question_data = bot.math_answers[user_id]
+    correct_answer = question_data["answer"]
+    current_streak = question_data["streak"]
 
 # Compare the raw message content without case sensitivity
 if message.content.strip().lower() == correct_answer.lower():
@@ -256,8 +255,9 @@ await bot.process_commands(message)
 # Leaderboard Command
 @bot.command()
 async def mathleaders(ctx):
-cursor.execute("SELECT user_id, points FROM leaderboard ORDER BY points DESC LIMIT 10")
-leaderboard = cursor.fetchall()
+    cursor.execute("SELECT user_id, points FROM leaderboard ORDER BY points DESC LIMIT 10")
+    leaderboard = cursor.fetchall()
+    
 
 if leaderboard:
 leaderboard_text = "\n".join(f"**#{i+1}** <@{user_id}> - **{points} points**" for i, (user_id, points) in enumerate(leaderboard))
@@ -277,10 +277,10 @@ await ctx.send(embed=embed)
 # Math Problem Solving Commands
 @bot.command()
 async def solve(ctx, *, problem: str):
-try:
-import openai
-client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-# Opdkjs
+    try:
+        import openai
+        client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
 
 response = client.chat.completions.create(
 model="gpt-3.5-turbo",
@@ -480,13 +480,13 @@ await msg.delete()
 @bot.command()
 @commands.is_owner()
 async def shutdown(ctx):
-embed = create_embed(
-title="🛑 Shutting Down",
-description="Mathilda is powering off...",
-color=Color.red()
-)
-await ctx.send(embed=embed)
-await bot.close()
+    embed = create_embed(
+        title="🛑 Shutting Down",
+        description="Mathilda is powering off...",
+        color=Color.red()
+    )
+    await ctx.send(embed=embed)
+    await bot.close()
 
 # Error Handling
 @bot.event
