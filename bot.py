@@ -504,7 +504,15 @@ async def on_command_error(ctx, error):
         await ctx.send(embed=embed)
 
 # Run the bot
-TOKEN = os.getenv("DISCORD_TOKEN")
-if not TOKEN:
-    raise ValueError("DISCORD_TOKEN environment variable is not set!")
-bot.run(TOKEN)
+if __name__ == "__main__":
+    TOKEN = os.environ.get("DISCORD_TOKEN")
+    if not TOKEN:
+        print("❌ ERROR: Missing DISCORD_TOKEN environment variable")
+        print("Please set it in Render.com environment settings")
+        exit(1)
+    
+    try:
+        bot.run(TOKEN)
+    except discord.errors.LoginFailure:
+        print("❌ Invalid token - please regenerate in Discord Developer Portal")
+        exit(1)
