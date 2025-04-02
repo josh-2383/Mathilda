@@ -307,8 +307,9 @@ else:
 return
 
 # Detect Math Help Requests
-if any(trigger in content for trigger in bot.math_help_triggers):
-bot.conversation_states[user_id] = "math_help"
+if any(trigger in content for trigger in math_triggers):
+    bot.conversation_states[user_id] = "math_help"  # Properly indented under 'if' block
+
 embed = create_embed(
 title="🧮 Math Help Activated",
 description="Now in math help mode! Just type problems like:\n- `2+2`\n- `Solve 3x=9`\n- `Factor x²-4`\n\nSay 'cancel' when done.",
