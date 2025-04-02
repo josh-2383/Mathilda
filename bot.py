@@ -298,11 +298,10 @@ else:
 
 
 # Handle Conversational Math Help
-if user_id in bot.conversation_states and bot.conversation_states[user_id] == "math_help":
-if any(word in content for word in ["cancel", "stop", "done"]):
-del bot.conversation_states[user_id]
-await message.channel.send("Exited math help mode. Your streaks are preserved!")
-return
+if any(word in content for word in ["cancel", "stop", "done"]):  # Checking for 'cancel', 'stop', or 'done'
+    del bot.conversation_states[user_id]  # Remove user from conversation states
+    await message.channel.send("Exited math help mode. Your streaks are preserved!")  # Notify the user
+    return  # Exit the function after canceling math help
 else:
 await solve_math_question(message)
 return
