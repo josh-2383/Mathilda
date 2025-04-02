@@ -10,6 +10,7 @@ import threading
 from discord import Embed, Color
 import asyncio
 import pytesseract
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'  # Windows
 import cv2
 import numpy as np
 from PIL import Image
