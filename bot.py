@@ -114,9 +114,65 @@ bot.math_help_triggers = [
 # MATH QUESTION DATABASE
 # ======================
 math_questions = {
-    # ... [keep your existing math questions dictionary] ...
+    # Basic Arithmetic (15 questions)
+    "What is 2 + 2?": "4",
+    "What is 15 - 7?": "8",
+    "What is 6 × 9?": "54",
+    "What is 144 ÷ 12?": "12",
+    "What is 3^4?": "81",
+    "What is √144?": "12",
+    "What is 5! (factorial)?": "120",
+    "What is 15% of 200?": "30",
+    "What is 0.25 as a fraction?": "1/4",
+    "What is 3/4 + 1/2?": "5/4 or 1.25",
+    "What is 2^10?": "1024",
+    "What is the next prime number after 7?": "11",
+    "What is 1.5 × 2.5?": "3.75",
+    "What is 1000 ÷ 8?": "125",
+    "What is 17 × 3?": "51",
+    
+    # Algebra (10 questions)
+    "Solve for x: 3x + 5 = 20": "5",
+    "Factor x² - 9": "(x+3)(x-3)",
+    "Simplify 2(x + 3) + 4x": "6x + 6",
+    "Solve for y: 2y - 7 = 15": "11",
+    "Expand (x + 2)(x - 3)": "x² - x - 6",
+    "What is the slope of y = 2x + 5?": "2",
+    "Solve the system: x + y = 5, x - y = 1": "x=3,y=2",
+    "Simplify (x³ * x⁵) / x²": "x⁶",
+    "Solve the quadratic: x² - 5x + 6 = 0": "x=2,x=3",
+    "What is the vertex of y = x² - 4x + 3?": "(2,-1)",
+    
+    # Geometry (10 questions)
+    "Area of circle with radius 5": "78.54",
+    "Circumference of circle with diameter 10": "31.42",
+    "Volume of cube with side length 3": "27",
+    "Pythagorean theorem for 3-4-5 triangle": "5",
+    "Interior angle sum of hexagon": "720",
+    "Area of triangle with base 6 height 4": "12",
+    "Surface area of sphere with radius 2": "50.27",
+    "Volume of cylinder with radius 3 height 5": "141.37",
+    "Diagonal of 5×12 rectangle": "13",
+    "Exterior angle of regular octagon": "45",
+    
+    # Calculus (5 questions)
+    "Derivative of x³": "3x²",
+    "Integral of 2x dx": "x² + C",
+    "Derivative of sin(x)": "cos(x)",
+    "Limit as x→0 of (sin x)/x": "1",
+    "Integral of e^x dx": "e^x + C",
+    
+    # Word Problems (5 questions)
+    "If 5 apples cost $2.50, unit price?": "0.50",
+    "Train travels 300km in 2 hours. Speed?": "150 km/h",
+    "Rectangle area 24, length 6, width?": "4",
+    "20% discount on $50 item": "40",
+    "If 3 pencils cost $1.20, 5 pencils cost?": "2.00",
+    
+    # Fun/Easter Eggs (5 questions)
+    "What is the meaning of life, the universe and everything?": "42",
+    "You found secret question! Answer is Skibidi Sigma Rizzler": "Skibidi Sigma Rizzler"
 }
-
 # ======================
 # HELPER FUNCTIONS
 # ======================
