@@ -9,49 +9,68 @@ from flask import Flask
 import threading
 from discord import Embed, Color
 import asyncio
-# OCR IMPORTS (Under Progress)
-#import pytesseract
-#import cv2
-#import numpy as np
-#from PIL import Image
-#import io
-#import requests
 from datetime import datetime
 import time
 
 # ======================
-# DATABASE CONNECTION
+# DATABASE SETUP
 # ======================
-try:
+def init_database():
+    """Initialize database with all required tables and columns"""
     conn = sqlite3.connect('mathilda.db', timeout=10)
     cursor = conn.cursor()
-    print("✅ Database connection established")
-except sqlite3.Error as e:
-    print(f"❌ Database connection error: {e}")
-    raise
+    
+    # Create tables with IF NOT EXISTS
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS leaderboard (
+        user_id INTEGER PRIMARY KEY,
+        points INTEGER DEFAULT 0,
+        highest_streak INTEGER DEFAULT 0,
+        total_correct INTEGER DEFAULT 0,
+        last_active TEXT
+    )""")
+    
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS question_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        question TEXT,
+        answer TEXT,
+        was_correct BOOLEAN,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )""")
+    
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS corrections (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        wrong TEXT,
+        correct TEXT,
+        added_by INTEGER,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )""")
+    
+    # Add any missing columns to existing tables
+    cursor.execute("PRAGMA table_info(leaderboard)")
+    columns = [col[1] for col in cursor.fetchall()]
+    
+    if 'highest_streak' not in columns:
+        cursor.execute("ALTER TABLE leaderboard ADD COLUMN highest_streak INTEGER DEFAULT 0")
+    
+    if 'total_correct' not in columns:
+        cursor.execute("ALTER TABLE leaderboard ADD COLUMN total_correct INTEGER DEFAULT 0")
+    
+    if 'last_active' not in columns:
+        cursor.execute("ALTER TABLE leaderboard ADD COLUMN last_active TEXT")
+    
+    conn.commit()
+    return conn, cursor
 
-# ======================
-# OCR FUNCTIONALITY (Under Progress)
-# ======================
-"""
 try:
-    pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-except:
-    pass  # Will use system PATH on Linux/Heroku
-
-def extract_text_from_image(image_url):
-    try:
-        response = requests.get(image_url)
-        img = Image.open(io.BytesIO(response.content))
-        img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-        gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
-        _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
-        custom_config = r'--oem 3 --psm 6 -l eng+equ'
-        text = pytesseract.image_to_string(thresh, config=custom_config)
-        return text.strip()
-    except Exception as e:
-        return f"❌ OCR Error: {str(e)}"
-"""
+    conn, cursor = init_database()
+    print("✅ Database initialized successfully")
+except sqlite3.Error as e:
+    print(f"❌ Database initialization failed: {e}")
+    raise
 
 # ======================
 # FLASK WEB SERVER
@@ -75,10 +94,10 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Bot state management
-bot.math_answers = {}  # Current math challenges
-bot.question_streaks = {}  # User streaks
-bot.conversation_states = {}  # Active help sessions
-bot.user_cooldowns = {}  # Command rate limiting
+bot.math_answers = {}
+bot.question_streaks = {}
+bot.conversation_states = {}
+bot.user_cooldowns = {}
 
 # Math help triggers
 bot.math_help_triggers = [
@@ -90,81 +109,6 @@ bot.math_help_triggers = [
     "solve for",
     "how do I solve"
 ]
-
-# ======================
-# DATABASE SETUP
-# ======================
-def update_leaderboard(user_id, points_change=0, streak_update=0):
-    """Update leaderboard with atomic operations"""
-    now = datetime.now().isoformat()
-    
-    try:
-        cursor.execute("""
-        INSERT INTO leaderboard (user_id, points, highest_streak, total_correct, last_active)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(user_id) 
-        DO UPDATE SET 
-            points = points + ?,
-            highest_streak = MAX(COALESCE(highest_streak, 0), ?),
-            total_correct = total_correct + ?,
-            last_active = ?
-        """, (
-            user_id, 
-            points_change, 
-            streak_update,
-            int(points_change > 0),
-            now,
-            points_change,
-            streak_update,
-            int(points_change > 0),
-            now
-        ))
-        conn.commit()
-    except sqlite3.OperationalError:
-        # Fallback if columns don't exist
-        cursor.execute("""
-        INSERT INTO leaderboard (user_id, points)
-        VALUES (?, ?)
-        ON CONFLICT(user_id) 
-        DO UPDATE SET points = points + ?
-        """, (user_id, points_change, points_change))
-        conn.commit()
-
-# User question history
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS question_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    question TEXT,
-    answer TEXT,
-    was_correct BOOLEAN,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-)
-""")
-
-# Leaderboard table
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS leaderboard (
-    user_id INTEGER PRIMARY KEY,
-    points INTEGER DEFAULT 0,
-    highest_streak INTEGER DEFAULT 0,
-    total_correct INTEGER DEFAULT 0,
-    last_active TEXT
-)
-""")
-
-# Corrections table
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS corrections (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    wrong TEXT,
-    correct TEXT,
-    added_by INTEGER,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-)
-""")
-
-conn.commit()
 
 # ======================
 # MATH QUESTION DATABASE
@@ -256,13 +200,56 @@ def create_embed(title=None, description=None, color=Color.blue(),
         
     return embed
 
+def update_leaderboard(user_id, points_change=0, streak_update=0):
+    """Update leaderboard with atomic operations"""
+    now = datetime.now().isoformat()
+    
+    try:
+        # First try complete update
+        cursor.execute("""
+        INSERT INTO leaderboard (user_id, points, highest_streak, total_correct, last_active)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) 
+        DO UPDATE SET 
+            points = points + excluded.points,
+            highest_streak = MAX(highest_streak, excluded.highest_streak),
+            total_correct = total_correct + excluded.total_correct,
+            last_active = excluded.last_active
+        """, (
+            user_id, 
+            points_change, 
+            streak_update,
+            int(points_change > 0),
+            now
+        ))
+        conn.commit()
+    except sqlite3.Error as e:
+        print(f"Database error in update_leaderboard: {e}")
+        conn.rollback()
+        # Fallback to simple points update
+        try:
+            cursor.execute("""
+            INSERT INTO leaderboard (user_id, points)
+            VALUES (?, ?)
+            ON CONFLICT(user_id) 
+            DO UPDATE SET points = points + ?
+            """, (user_id, points_change, points_change))
+            conn.commit()
+        except sqlite3.Error as e:
+            print(f"Fallback update failed: {e}")
+            conn.rollback()
+
 def log_question(user_id, question, answer, correct):
     """Record question attempt in history"""
-    cursor.execute("""
-    INSERT INTO question_history (user_id, question, answer, was_correct)
-    VALUES (?, ?, ?, ?)
-    """, (user_id, question, answer, int(correct)))
-    conn.commit()
+    try:
+        cursor.execute("""
+        INSERT INTO question_history (user_id, question, answer, was_correct)
+        VALUES (?, ?, ?, ?)
+        """, (user_id, question, answer, int(correct)))
+        conn.commit()
+    except sqlite3.Error as e:
+        print(f"Database error in log_question: {e}")
+        conn.rollback()
 
 # ======================
 # CORE COMMANDS
@@ -447,39 +434,55 @@ async def integrate(ctx, *, expression: str):
 @bot.command()
 async def convert(ctx, *, query: str):
     """Get a correction from database"""
-    cursor.execute("SELECT correct FROM corrections WHERE wrong = ?", (query,))
-    row = cursor.fetchone()
-    
-    if row:
-        embed = create_embed(
-            title="🔄 Correction Found",
-            description=f"**You asked:** {query}\n**Correction:** {row[0]}",
-            color=Color.green()
+    try:
+        cursor.execute("SELECT correct FROM corrections WHERE wrong = ?", (query,))
+        row = cursor.fetchone()
+        
+        if row:
+            embed = create_embed(
+                title="🔄 Correction Found",
+                description=f"**You asked:** {query}\n**Correction:** {row[0]}",
+                color=Color.green()
+            )
+        else:
+            embed = create_embed(
+                title="❓ No Correction Found",
+                description=f"No known correction for: {query}\nUse `!learn {query} correction` to add one",
+                color=Color.orange()
+            )
+        await ctx.send(embed=embed)
+    except sqlite3.Error as e:
+        error_embed = create_embed(
+            title="❌ Database Error",
+            description=f"Couldn't retrieve correction: {str(e)}",
+            color=Color.red()
         )
-    else:
-        embed = create_embed(
-            title="❓ No Correction Found",
-            description=f"No known correction for: {query}\nUse `!learn {query} correction` to add one",
-            color=Color.orange()
-        )
-    await ctx.send(embed=embed)
+        await ctx.send(embed=error_embed)
 
 @bot.command()
 async def learn(ctx, incorrect: str, correct: str):
     """Learn a new correction"""
-    cursor.execute(
-        "INSERT INTO corrections (wrong, correct, added_by) VALUES (?, ?, ?)",
-        (incorrect, correct, ctx.author.id)
-    )
-    conn.commit()
-    
-    embed = create_embed(
-        title="📚 Learned New Correction",
-        description=f"Added to database:\n**Incorrect:** {incorrect}\n**Correct:** {correct}",
-        color=Color.green(),
-        footer=f"Added by {ctx.author.name}"
-    )
-    await ctx.send(embed=embed)
+    try:
+        cursor.execute(
+            "INSERT INTO corrections (wrong, correct, added_by) VALUES (?, ?, ?)",
+            (incorrect, correct, ctx.author.id)
+        )
+        conn.commit()
+        
+        embed = create_embed(
+            title="📚 Learned New Correction",
+            description=f"Added to database:\n**Incorrect:** {incorrect}\n**Correct:** {correct}",
+            color=Color.green(),
+            footer=f"Added by {ctx.author.name}"
+        )
+        await ctx.send(embed=embed)
+    except sqlite3.Error as e:
+        error_embed = create_embed(
+            title="❌ Database Error",
+            description=f"Couldn't save correction: {str(e)}",
+            color=Color.red()
+        )
+        await ctx.send(embed=error_embed)
 
 @bot.command()
 async def unlearn(ctx, incorrect: str):
@@ -488,36 +491,52 @@ async def unlearn(ctx, incorrect: str):
         await ctx.send("🚨 You need Manage Messages permission to use this!")
         return
         
-    cursor.execute("DELETE FROM corrections WHERE wrong = ?", (incorrect,))
-    conn.commit()
-    
-    embed = create_embed(
-        title="🗑️ Removed Correction",
-        description=f"Removed entry for: {incorrect}",
-        color=Color.green()
-    )
-    await ctx.send(embed=embed)
+    try:
+        cursor.execute("DELETE FROM corrections WHERE wrong = ?", (incorrect,))
+        conn.commit()
+        
+        embed = create_embed(
+            title="🗑️ Removed Correction",
+            description=f"Removed entry for: {incorrect}",
+            color=Color.green()
+        )
+        await ctx.send(embed=embed)
+    except sqlite3.Error as e:
+        error_embed = create_embed(
+            title="❌ Database Error",
+            description=f"Couldn't remove correction: {str(e)}",
+            color=Color.red()
+        )
+        await ctx.send(embed=error_embed)
 
 @bot.command()
 async def corrections(ctx):
     """List all corrections in database"""
-    cursor.execute("SELECT wrong, correct FROM corrections ORDER BY timestamp DESC LIMIT 20")
-    rows = cursor.fetchall()
-    
-    if rows:
-        corrections_list = "\n".join([f"• **{row[0]}** → {row[1]}" for row in rows])
-        embed = create_embed(
-            title="📖 Recent Corrections (20)",
-            description=corrections_list,
-            color=Color.blue()
+    try:
+        cursor.execute("SELECT wrong, correct FROM corrections ORDER BY timestamp DESC LIMIT 20")
+        rows = cursor.fetchall()
+        
+        if rows:
+            corrections_list = "\n".join([f"• **{row[0]}** → {row[1]}" for row in rows])
+            embed = create_embed(
+                title="📖 Recent Corrections (20)",
+                description=corrections_list,
+                color=Color.blue()
+            )
+        else:
+            embed = create_embed(
+                title="📖 Correction Database",
+                description="No corrections stored yet.",
+                color=Color.blue()
+            )
+        await ctx.send(embed=embed)
+    except sqlite3.Error as e:
+        error_embed = create_embed(
+            title="❌ Database Error",
+            description=f"Couldn't retrieve corrections: {str(e)}",
+            color=Color.red()
         )
-    else:
-        embed = create_embed(
-            title="📖 Correction Database",
-            description="No corrections stored yet.",
-            color=Color.blue()
-        )
-    await ctx.send(embed=embed)
+        await ctx.send(embed=error_embed)
 
 # ======================
 # STATS & LEADERBOARD
@@ -525,78 +544,94 @@ async def corrections(ctx):
 @bot.command()
 async def mathleaders(ctx):
     """Show the math leaderboard"""
-    cursor.execute("""
-    SELECT user_id, points, highest_streak 
-    FROM leaderboard 
-    ORDER BY points DESC 
-    LIMIT 10
-    """)
-    leaderboard = cursor.fetchall()
-    
-    if leaderboard:
-        leaderboard_text = "\n".join(
-            f"**#{i+1}** <@{row[0]}> - **{row[1]} pts** (Best streak: {row[2]})"
-            for i, row in enumerate(leaderboard))
+    try:
+        cursor.execute("""
+        SELECT user_id, points, highest_streak 
+        FROM leaderboard 
+        ORDER BY points DESC 
+        LIMIT 10
+        """)
+        leaderboard = cursor.fetchall()
         
-        embed = create_embed(
-            title="🏆 Math Leaderboard (Top 10)",
-            description=leaderboard_text,
-            color=Color.gold()
+        if leaderboard:
+            leaderboard_text = "\n".join(
+                f"**#{i+1}** <@{row[0]}> - **{row[1]} pts** (Best streak: {row[2]})"
+                for i, row in enumerate(leaderboard))
+            
+            embed = create_embed(
+                title="🏆 Math Leaderboard (Top 10)",
+                description=leaderboard_text,
+                color=Color.gold()
+            )
+        else:
+            embed = create_embed(
+                title="🏆 Math Leaderboard",
+                description="No scores yet! Be the first with `!mathquest`",
+                color=Color.gold()
+            )
+        await ctx.send(embed=embed)
+    except sqlite3.Error as e:
+        error_embed = create_embed(
+            title="❌ Database Error",
+            description=f"Couldn't retrieve leaderboard: {str(e)}",
+            color=Color.red()
         )
-    else:
-        embed = create_embed(
-            title="🏆 Math Leaderboard",
-            description="No scores yet! Be the first with `!mathquest`",
-            color=Color.gold()
-        )
-    await ctx.send(embed=embed)
+        await ctx.send(embed=error_embed)
 
 @bot.command()
 async def mystats(ctx):
     """Show your math statistics"""
     user_id = ctx.author.id
     
-    cursor.execute("""
-    SELECT points, highest_streak, total_correct, last_active
-    FROM leaderboard
-    WHERE user_id = ?
-    """, (user_id,))
-    
-    stats = cursor.fetchone()
-    
-    if stats:
-        points, highest_streak, total_correct, last_active = stats
-        
-        # Get total questions attempted
+    try:
         cursor.execute("""
-        SELECT COUNT(*) FROM question_history
+        SELECT points, highest_streak, total_correct, last_active
+        FROM leaderboard
         WHERE user_id = ?
         """, (user_id,))
-        total_attempted = cursor.fetchone()[0]
         
-        accuracy = (total_correct / total_attempted * 100) if total_attempted > 0 else 0
+        stats = cursor.fetchone()
         
-        embed = create_embed(
-            title=f"📊 {ctx.author.name}'s Math Stats",
-            color=Color.blue(),
-            fields=[
-                ("🏅 Points", str(points), True),
-                ("🔥 Best Streak", str(highest_streak), True),
-                ("✅ Correct Answers", str(total_correct), True),
-                ("📝 Total Attempted", str(total_attempted), True),
-                ("🎯 Accuracy", f"{accuracy:.1f}%", True),
-                ("⏱️ Last Active", last_active.split('.')[0], True)
-            ],
-            thumbnail=ctx.author.avatar.url
+        if stats:
+            points, highest_streak, total_correct, last_active = stats
+            
+            # Get total questions attempted
+            cursor.execute("""
+            SELECT COUNT(*) FROM question_history
+            WHERE user_id = ?
+            """, (user_id,))
+            total_attempted = cursor.fetchone()[0]
+            
+            accuracy = (total_correct / total_attempted * 100) if total_attempted > 0 else 0
+            
+            embed = create_embed(
+                title=f"📊 {ctx.author.name}'s Math Stats",
+                color=Color.blue(),
+                fields=[
+                    ("🏅 Points", str(points), True),
+                    ("🔥 Best Streak", str(highest_streak), True),
+                    ("✅ Correct Answers", str(total_correct), True),
+                    ("📝 Total Attempted", str(total_attempted), True),
+                    ("🎯 Accuracy", f"{accuracy:.1f}%", True),
+                    ("⏱️ Last Active", last_active.split('.')[0] if last_active else "Never", True)
+                ],
+                thumbnail=ctx.author.avatar.url
+            )
+        else:
+            embed = create_embed(
+                title=f"📊 {ctx.author.name}'s Stats",
+                description="You haven't answered any math questions yet!\nUse `!mathquest` to get started.",
+                color=Color.blue()
+            )
+        
+        await ctx.send(embed=embed)
+    except sqlite3.Error as e:
+        error_embed = create_embed(
+            title="❌ Database Error",
+            description=f"Couldn't retrieve stats: {str(e)}",
+            color=Color.red()
         )
-    else:
-        embed = create_embed(
-            title=f"📊 {ctx.author.name}'s Stats",
-            description="You haven't answered any math questions yet!\nUse `!mathquest` to get started.",
-            color=Color.blue()
-        )
-    
-    await ctx.send(embed=embed)
+        await ctx.send(embed=error_embed)
 
 # ======================
 # UTILITY COMMANDS
@@ -845,4 +880,5 @@ if __name__ == "__main__":
         bot.run(TOKEN)
     except discord.errors.LoginFailure:
         print("❌ Invalid token - please check your DISCORD_TOKEN")
-        exit(1)
+    finally:
+        conn.close()
