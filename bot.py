@@ -20,6 +20,17 @@ from datetime import datetime
 import time
 
 # ======================
+# DATABASE CONNECTION
+# ======================
+try:
+    conn = sqlite3.connect('mathilda.db', timeout=10)
+    cursor = conn.cursor()
+    print("✅ Database connection established")
+except sqlite3.Error as e:
+    print(f"❌ Database connection error: {e}")
+    raise
+
+# ======================
 # OCR FUNCTIONALITY (Under Progress)
 # ======================
 """
@@ -131,6 +142,28 @@ CREATE TABLE IF NOT EXISTS question_history (
 )
 """)
 
+# Leaderboard table
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS leaderboard (
+    user_id INTEGER PRIMARY KEY,
+    points INTEGER DEFAULT 0,
+    highest_streak INTEGER DEFAULT 0,
+    total_correct INTEGER DEFAULT 0,
+    last_active TEXT
+)
+""")
+
+# Corrections table
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS corrections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    wrong TEXT,
+    correct TEXT,
+    added_by INTEGER,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+""")
+
 conn.commit()
 
 # ======================
@@ -223,42 +256,6 @@ def create_embed(title=None, description=None, color=Color.blue(),
         
     return embed
 
-def update_leaderboard(user_id, points_change=0, streak_update=0):
-    """Update leaderboard with atomic operations"""
-    now = datetime.now().isoformat()
-    
-    try:
-        cursor.execute("""
-        INSERT INTO leaderboard (user_id, points, highest_streak, total_correct, last_active)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(user_id) 
-        DO UPDATE SET 
-            points = points + ?,
-            highest_streak = MAX(COALESCE(highest_streak, 0), ?),
-            total_correct = total_correct + ?,
-            last_active = ?
-        """, (
-            user_id, 
-            points_change, 
-            streak_update,
-            int(points_change > 0),
-            now,
-            points_change,
-            streak_update,
-            int(points_change > 0),
-            now
-        ))
-        conn.commit()
-    except sqlite3.OperationalError:
-        # Fallback if columns don't exist
-        cursor.execute("""
-        INSERT INTO leaderboard (user_id, points)
-        VALUES (?, ?)
-        ON CONFLICT(user_id) 
-        DO UPDATE SET points = points + ?
-        """, (user_id, points_change, points_change))
-        conn.commit()
-
 def log_question(user_id, question, answer, correct):
     """Record question attempt in history"""
     cursor.execute("""
@@ -275,31 +272,6 @@ async def on_ready():
     """Bot startup handler"""
     print(f"🚀 Mathilda is online! Logged in as {bot.user}")
     await bot.change_presence(activity=discord.Game(name="!help for commands"))
-
-# OCR COMMAND (Under Progress)
-"""
-@bot.command()
-async def ocr(ctx, image_url: str = None):
-    if not image_url and not ctx.message.attachments:
-        await ctx.send("🚨 Please attach an image or provide a URL!")
-        return
-    
-    if not image_url:
-        image_url = ctx.message.attachments[0].url
-    
-    processing_msg = await ctx.send("🔍 Processing image...")
-    extracted_text = extract_text_from_image(image_url)
-    
-    if extracted_text.startswith("❌"):
-        await processing_msg.edit(content=extracted_text)
-        return
-    
-    await processing_msg.edit(content=f"📝 Extracted text:\n```{extracted_text}```")
-    
-    math_symbols = ['+', '-', '=', 'x', '÷', '^', '√', '∫', 'π']
-    if any(symbol in extracted_text for symbol in math_symbols):
-        await solve(ctx, problem=extracted_text)
-"""
 
 @bot.command()
 async def mathquest(ctx):
@@ -709,6 +681,7 @@ async def shutdown(ctx):
         color=Color.red()
     )
     await ctx.send(embed=embed)
+    conn.close()
     await bot.close()
 
 # ======================
@@ -720,15 +693,6 @@ async def on_message(message):
         return
     
     ctx = await bot.get_context(message)
-    
-    """
-    # OCR HANDLING (Under Progress)
-    if message.attachments:
-        for attachment in message.attachments:
-            if attachment.filename.lower().endswith(('.png', '.jpg', '.jpeg')):
-                await ctx.send("🛠️ OCR feature is currently under development")
-                return
-    """
     
     user_id = message.author.id
     content = message.content.lower().strip()
@@ -817,6 +781,19 @@ async def on_message(message):
         return
     
     await bot.process_commands(message)
+
+async def solve_math_question(message):
+    """Helper function to solve math questions in help mode"""
+    try:
+        ctx = await bot.get_context(message)
+        await solve(ctx, problem=message.content)
+    except Exception as e:
+        error_embed = create_embed(
+            title="❌ Error",
+            description=f"Error solving problem: {e}",
+            color=Color.red()
+        )
+        await message.channel.send(embed=error_embed)
 
 # ======================
 # ERROR HANDLER
