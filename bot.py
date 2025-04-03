@@ -96,7 +96,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # Bot state management
 bot.math_answers = {}
 bot.question_streaks = {}
-bot.conversation_states = {}
+bot.conversation_states = {}  # Now stores dicts instead of strings
 bot.user_cooldowns = {}
 
 # Math help triggers
@@ -114,67 +114,7 @@ bot.math_help_triggers = [
 # MATH QUESTION DATABASE
 # ======================
 math_questions = {
-    # Basic Arithmetic (15 questions)
-    "What is 2 + 2?": "4",
-    "What is 15 - 7?": "8",
-    "What is 6 × 9?": "54",
-    "What is 144 ÷ 12?": "12",
-    "What is 3^4?": "81",
-    "What is √144?": "12",
-    "What is 5! (factorial)?": "120",
-    "What is 15% of 200?": "30",
-    "What is 0.25 as a fraction?": "1/4",
-    "What is 3/4 + 1/2?": "5/4 or 1.25",
-    "What is 2^10?": "1024",
-    "What is the next prime number after 7?": "11",
-    "What is 1.5 × 2.5?": "3.75",
-    "What is 1000 ÷ 8?": "125",
-    "What is 17 × 3?": "51",
-    
-    # Algebra (10 questions)
-    "Solve for x: 3x + 5 = 20": "5",
-    "Factor x² - 9": "(x+3)(x-3)",
-    "Simplify 2(x + 3) + 4x": "6x + 6",
-    "Solve for y: 2y - 7 = 15": "11",
-    "Expand (x + 2)(x - 3)": "x² - x - 6",
-    "What is the slope of y = 2x + 5?": "2",
-    "Solve the system: x + y = 5, x - y = 1": "x=3,y=2",
-    "Simplify (x³ * x⁵) / x²": "x⁶",
-    "Solve the quadratic: x² - 5x + 6 = 0": "x=2,x=3",
-    "What is the vertex of y = x² - 4x + 3?": "(2,-1)",
-    
-    # Geometry (10 questions)
-    "Area of circle with radius 5": "78.54",
-    "Circumference of circle with diameter 10": "31.42",
-    "Volume of cube with side length 3": "27",
-    "Pythagorean theorem for 3-4-5 triangle": "5",
-    "Interior angle sum of hexagon": "720",
-    "Area of triangle with base 6 height 4": "12",
-    "Surface area of sphere with radius 2": "50.27",
-    "Volume of cylinder with radius 3 height 5": "141.37",
-    "Diagonal of 5×12 rectangle": "13",
-    "Exterior angle of regular octagon": "45",
-    
-    # Calculus (5 questions)
-    "Derivative of x³": "3x²",
-    "Integral of 2x dx": "x² + C",
-    "Derivative of sin(x)": "cos(x)",
-    "Limit as x→0 of (sin x)/x": "1",
-    "Integral of e^x dx": "e^x + C",
-    
-    # Word Problems (5 questions)
-    "If 5 apples cost $2.50, unit price?": "0.50",
-    "Train travels 300km in 2 hours. Speed?": "150 km/h",
-    "Rectangle area 24, length 6, width?": "4",
-    "20% discount on $50 item": "40",
-    "If 3 pencils cost $1.20, 5 pencils cost?": "2.00",
-    
-    # Fun/Easter Eggs (5 questions)
-    "Answer to the Ultimate Question": "42",
-    "Secret math code 1": "π",
-    "Secret math code 2": "∞",
-    "Secret math code 3": "√-1",
-    "You found secret question! Answer is Skibidi Sigma Rizzler": "Skibidi Sigma Rizzler"
+    # ... [keep your existing math questions dictionary] ...
 }
 
 # ======================
@@ -205,7 +145,6 @@ def update_leaderboard(user_id, points_change=0, streak_update=0):
     now = datetime.now().isoformat()
     
     try:
-        # First try complete update
         cursor.execute("""
         INSERT INTO leaderboard (user_id, points, highest_streak, total_correct, last_active)
         VALUES (?, ?, ?, ?, ?)
@@ -226,18 +165,6 @@ def update_leaderboard(user_id, points_change=0, streak_update=0):
     except sqlite3.Error as e:
         print(f"Database error in update_leaderboard: {e}")
         conn.rollback()
-        # Fallback to simple points update
-        try:
-            cursor.execute("""
-            INSERT INTO leaderboard (user_id, points)
-            VALUES (?, ?)
-            ON CONFLICT(user_id) 
-            DO UPDATE SET points = points + ?
-            """, (user_id, points_change, points_change))
-            conn.commit()
-        except sqlite3.Error as e:
-            print(f"Fallback update failed: {e}")
-            conn.rollback()
 
 def log_question(user_id, question, answer, correct):
     """Record question attempt in history"""
@@ -720,7 +647,7 @@ async def shutdown(ctx):
     await bot.close()
 
 # ======================
-# MESSAGE HANDLER
+# MESSAGE HANDLER - FIXED VERSION
 # ======================
 @bot.event
 async def on_message(message):
@@ -728,11 +655,50 @@ async def on_message(message):
         return
     
     ctx = await bot.get_context(message)
-    
     user_id = message.author.id
     content = message.content.lower().strip()
-    
-    # Handle Math Quest answers
+
+    # First check if this is a help request
+    if any(trigger in content for trigger in bot.math_help_triggers):
+        # If currently in mathquest, preserve the state
+        if user_id in bot.math_answers:
+            bot.conversation_states[user_id] = {
+                "mode": "math_help",
+                "saved_mathquest": bot.math_answers[user_id]
+            }
+            del bot.math_answers[user_id]  # Temporarily remove from math answers
+        else:
+            bot.conversation_states[user_id] = {"mode": "math_help"}
+            
+        embed = create_embed(
+            title="🧮 Math Help Activated",
+            description="""Now in math help mode! 
+            \nJust type problems like:
+            - `2+2`
+            - `Solve 3x=9`
+            - `Factor x²-4`
+            \nSay 'cancel' when done.""",
+            color=Color.blue()
+        )
+        await message.channel.send(embed=embed)
+        return
+
+    # Handle math help mode
+    if user_id in bot.conversation_states and bot.conversation_states[user_id].get("mode") == "math_help":
+        if any(word in content for word in ["cancel", "stop", "done"]):
+            # Restore mathquest state if it existed
+            if "saved_mathquest" in bot.conversation_states[user_id]:
+                bot.math_answers[user_id] = bot.conversation_states[user_id]["saved_mathquest"]
+                await message.channel.send("Exited math help mode. Returning to your math quest!")
+            else:
+                await message.channel.send("Exited math help mode.")
+            del bot.conversation_states[user_id]
+            return
+        else:
+            await solve_math_question(message)
+            return
+
+    # Handle Math Quest answers (only if not in help mode)
     if user_id in bot.math_answers:
         question_data = bot.math_answers[user_id]
         correct_answer = question_data["answer"]
@@ -743,11 +709,9 @@ async def on_message(message):
             current_streak += 1
             points = 10 + (current_streak * 2)
             
-            # Update database
             update_leaderboard(user_id, points, current_streak)
             log_question(user_id, question_data["question"], content, True)
             
-            # Get new question
             new_question, new_answer = random.choice(list(math_questions.items()))
             bot.math_answers[user_id] = {
                 "answer": new_answer,
@@ -756,7 +720,6 @@ async def on_message(message):
             }
             bot.question_streaks[user_id] = current_streak
             
-            # Send response
             embed = create_embed(
                 title=f"✅ Correct! (Streak: {current_streak})",
                 description=f"""You earned {points} points!
@@ -766,9 +729,7 @@ async def on_message(message):
             await message.channel.send(embed=embed)
             
         else:
-            # Incorrect answer handling
             lost_points = min(5, current_streak * 2)
-            
             update_leaderboard(user_id, -lost_points)
             log_question(user_id, question_data["question"], content, False)
             
@@ -782,37 +743,10 @@ async def on_message(message):
             )
             await message.channel.send(embed=embed)
             
-            # Reset streak
             del bot.math_answers[user_id]
             if user_id in bot.question_streaks:
                 del bot.question_streaks[user_id]
                 
-        return
-    
-    # Handle math help mode
-    if user_id in bot.conversation_states and bot.conversation_states[user_id] == "math_help":
-        if any(word in content for word in ["cancel", "stop", "done"]):
-            del bot.conversation_states[user_id]
-            await message.channel.send("Exited math help mode. Your streaks are preserved!")
-            return
-        else:
-            await solve_math_question(message)
-            return
-    
-    # Detect math help requests
-    if any(trigger in content for trigger in bot.math_help_triggers):
-        bot.conversation_states[user_id] = "math_help"
-        embed = create_embed(
-            title="🧮 Math Help Activated",
-            description="""Now in math help mode! 
-            \nJust type problems like:
-            - `2+2`
-            - `Solve 3x=9`
-            - `Factor x²-4`
-            \nSay 'cancel' when done.""",
-            color=Color.blue()
-        )
-        await message.channel.send(embed=embed)
         return
     
     await bot.process_commands(message)
