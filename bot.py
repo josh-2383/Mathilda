@@ -83,29 +83,41 @@ bot.math_help_triggers = [
 # ======================
 # DATABASE SETUP
 # ======================
-conn = sqlite3.connect("mathilda.db", check_same_thread=False)
-cursor = conn.cursor()
-
-# Corrections database
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS corrections (
-    wrong TEXT PRIMARY KEY, 
-    correct TEXT,
-    added_by INTEGER,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-)
-""")
-
-# Leaderboard with enhanced stats
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS leaderboard (
-    user_id INTEGER PRIMARY KEY,
-    points INTEGER DEFAULT 0,
-    highest_streak INTEGER DEFAULT 0,
-    total_correct INTEGER DEFAULT 0,
-    last_active DATETIME
-)
-""")
+def update_leaderboard(user_id, points_change=0, streak_update=0):
+    """Update leaderboard with atomic operations"""
+    now = datetime.now().isoformat()
+    
+    try:
+        cursor.execute("""
+        INSERT INTO leaderboard (user_id, points, highest_streak, total_correct, last_active)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) 
+        DO UPDATE SET 
+            points = points + ?,
+            highest_streak = MAX(COALESCE(highest_streak, 0), ?),
+            total_correct = total_correct + ?,
+            last_active = ?
+        """, (
+            user_id, 
+            points_change, 
+            streak_update,
+            int(points_change > 0),
+            now,
+            points_change,
+            streak_update,
+            int(points_change > 0),
+            now
+        ))
+        conn.commit()
+    except sqlite3.OperationalError:
+        # Fallback if columns don't exist
+        cursor.execute("""
+        INSERT INTO leaderboard (user_id, points)
+        VALUES (?, ?)
+        ON CONFLICT(user_id) 
+        DO UPDATE SET points = points + ?
+        """, (user_id, points_change, points_change))
+        conn.commit()
 
 # User question history
 cursor.execute("""
@@ -215,27 +227,37 @@ def update_leaderboard(user_id, points_change=0, streak_update=0):
     """Update leaderboard with atomic operations"""
     now = datetime.now().isoformat()
     
-    cursor.execute("""
-    INSERT INTO leaderboard (user_id, points, highest_streak, total_correct, last_active)
-    VALUES (?, ?, ?, ?, ?)
-    ON CONFLICT(user_id) 
-    DO UPDATE SET 
-        points = points + ?,
-        highest_streak = MAX(highest_streak, ?),
-        total_correct = total_correct + ?,
-        last_active = ?
-    """, (
-        user_id, 
-        points_change, 
-        streak_update,
-        int(points_change > 0),  # Only increment if points increased
-        now,
-        points_change,
-        streak_update,
-        int(points_change > 0),
-        now
-    ))
-    conn.commit()
+    try:
+        cursor.execute("""
+        INSERT INTO leaderboard (user_id, points, highest_streak, total_correct, last_active)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) 
+        DO UPDATE SET 
+            points = points + ?,
+            highest_streak = MAX(COALESCE(highest_streak, 0), ?),
+            total_correct = total_correct + ?,
+            last_active = ?
+        """, (
+            user_id, 
+            points_change, 
+            streak_update,
+            int(points_change > 0),
+            now,
+            points_change,
+            streak_update,
+            int(points_change > 0),
+            now
+        ))
+        conn.commit()
+    except sqlite3.OperationalError:
+        # Fallback if columns don't exist
+        cursor.execute("""
+        INSERT INTO leaderboard (user_id, points)
+        VALUES (?, ?)
+        ON CONFLICT(user_id) 
+        DO UPDATE SET points = points + ?
+        """, (user_id, points_change, points_change))
+        conn.commit()
 
 def log_question(user_id, question, answer, correct):
     """Record question attempt in history"""
