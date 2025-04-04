@@ -32,6 +32,8 @@ logging.basicConfig(level=log_level, format='%(asctime)s:%(levelname)s:%(name)s:
 # Set higher level for noisy libraries if desired
 logging.getLogger('discord.http').setLevel(logging.WARNING)
 logging.getLogger('PIL').setLevel(logging.WARNING)
+# Suppress Flask's default logger if needed (can be verbose)
+logging.getLogger('werkzeug').setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
@@ -54,11 +56,13 @@ if not OPENAI_API_KEY:
 # discord.py>=2.0.0
 # openai>=1.0.0
 # sympy
-# Flask
+# Flask       # Required for Render Web Service port binding
 # python-dotenv (if using a .env file locally)
-# Pillow        # <--- ADD for OCR
-# pytesseract   # <--- ADD for OCR
-# requests      # <--- ADD for OCR (or ensure it's there)
+# Pillow        # For OCR
+# pytesseract   # For OCR
+# requests      # For OCR/HTTP requests
+# gunicorn      # Optional: Production WSGI server (recommended over Flask dev server)
+# waitress      # Optional: Alternative WSGI server
 
 # TESSERACT INSTALLATION (For build.sh or system setup)
 # Make sure Tesseract OCR engine is installed!
@@ -132,16 +136,11 @@ def init_database():
             cursor.execute("ALTER TABLE leaderboard ADD COLUMN last_active TEXT")
             logger.info("Added missing column 'last_active' to leaderboard.")
 
-        # Example for future migration: Changing user_id type (complex, requires data copy)
-        # if any(col[2].upper() == 'INTEGER' for col in table_info if col[1].lower() == 'user_id'):
-        #    logger.warning("Detected INTEGER user_id column, migration to TEXT might be needed manually.")
-
         conn.commit()
         logger.info("✅ Database initialized successfully")
-        # Keep the main connection open for the bot's lifetime if needed,
-        # otherwise, create connections per function for thread safety.
-        # For now, returning the connection to be managed globally (simpler but less thread-safe without external locking)
-        return conn, cursor
+        # Close this initial connection; functions will create their own.
+        conn.close()
+        return True # Indicate success
     except sqlite3.Error as e:
         logger.error(f"❌ Database initialization/migration failed: {e}", exc_info=True)
         if conn:
@@ -149,46 +148,52 @@ def init_database():
             conn.close() # Close connection on failure
         raise # Re-raise the exception to halt execution if DB fails
 
-# --- Global DB Connection (Simpler approach, less thread-safe) ---
-# Be cautious if using threads heavily outside of run_in_executor
-# conn, cursor = None, None # Initialize as None
-# try:
-#     conn, cursor = init_database()
-# except Exception as e:
-#     logger.critical(f"❌ Halting execution due to database initialization failure: {e}")
-#     exit(1)
-# Use local connections within functions instead for better thread safety
-# --------------------------------------------------------------------
+# --- Initialize DB on startup ---
+try:
+    init_database()
+except Exception as db_init_err:
+    logger.critical(f"❌ Halting execution due to database initialization failure: {db_init_err}")
+    exit(1)
+# ---------------------------------
+
 
 # ======================
-# FLASK WEB SERVER (for hosting platforms like Replit/Render)
+# FLASK WEB SERVER (Required for Render Web Service Port Binding) - CORRECTED
 # ======================
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    # Could add basic stats display here if desired
+    # Simple health check endpoint
     return f"Mathilda Discord Bot is running! ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})"
 
 def run_flask():
-    port = int(os.environ.get('PORT', 8080))
-    host = "0.0.0.0"
+    # Render provides the port to bind to via the PORT environment variable
+    port = int(os.environ.get('PORT', 8080)) # Default to 8080 if PORT not set (e.g., local dev)
+    host = "0.0.0.0" # Bind to 0.0.0.0 to accept connections from Render's proxy
     try:
-        # Consider using a production-ready server like waitress or gunicorn
+        # NOTE: Flask's development server (app.run) is not recommended for production.
+        # Consider using a production-grade WSGI server like Gunicorn or Waitress.
+        # Example with Waitress (add 'waitress' to requirements.txt):
         # from waitress import serve
+        # logger.info(f"Starting Waitress server on {host}:{port}")
         # serve(app, host=host, port=port)
-        logger.info(f"Starting Flask server on {host}:{port}")
-        app.run(host=host, port=port) # Flask's built-in server (okay for simple keep-alive)
-    except Exception as e:
-        logger.error(f"❌ Flask server failed to start: {e}", exc_info=True)
 
-# Run Flask in a separate thread only if needed for hosting platform keep-alive
-if os.environ.get("RUN_FLASK_SERVER", "false").lower() == "true":
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    logger.info("Flask server thread started.")
-else:
-    logger.info("Flask server not started (RUN_FLASK_SERVER not 'true').")
+        # Using Flask's dev server for simplicity to meet Render's requirement:
+        logger.info(f"Starting Flask development server on {host}:{port}")
+        # Disable reloader and debug for production-like behavior if using app.run
+        app.run(host=host, port=port, debug=False, use_reloader=False)
+
+    except Exception as e:
+        logger.error(f"❌ Flask server failed to start or crashed: {e}", exc_info=True)
+
+# Start the Flask server in a separate thread so it doesn't block the Discord bot
+# This thread MUST run for Render Web Services.
+flask_thread = threading.Thread(target=run_flask, daemon=True)
+# flask_thread.name = "FlaskServerThread" # Optional: Name the thread for easier debugging
+flask_thread.start()
+logger.info("Flask server thread started to handle web service requests.")
+# --------------------------------------------------------------------------
 
 
 # ======================
@@ -201,7 +206,7 @@ bot = commands.Bot(
     command_prefix="!",
     intents=intents,
     help_command=commands.DefaultHelpCommand(no_category='Commands'), # Group commands under 'Commands'
-    activity=discord.Game(name="!help for commands"), # Initial activity
+    activity=discord.Game(name="!help | Math Time!"), # Initial activity
     case_insensitive=True # Allow commands like !Ping or !solve
 )
 
@@ -210,7 +215,7 @@ bot.math_answers = {} # Stores current math quest {user_id: {"question": str, "a
 bot.question_streaks = {} # Stores only the streak {user_id: int}, potentially redundant with math_answers but kept for simplicity
 bot.conversation_states = {} # Stores dicts: {user_id: {"mode": "math_help"}}
 
-# Math help triggers (lowercase)
+# Math help triggers (lowercase set for faster lookups)
 bot.math_help_triggers = {
     "help with math", "math question", "solve this", "how to calculate",
     "math help", "solve for", "how do i solve", "calculate", "math problem"
@@ -319,10 +324,10 @@ def create_embed(title=None, description=None, color=Color.blue(),
 def db_execute(sql, params=(), fetch_one=False, fetch_all=False, commit=False):
     """Executes a SQL query with local connection management."""
     conn = None
+    cursor = None # Ensure cursor is defined
     try:
         conn = sqlite3.connect(DB_NAME, timeout=10)
-        # Consider setting isolation_level=None for autocommit if preferred
-        # or manage transactions explicitly with BEGIN/COMMIT/ROLLBACK
+        conn.execute("PRAGMA foreign_keys = ON") # Good practice
         cursor = conn.cursor()
         cursor.execute(sql, params)
 
@@ -337,12 +342,22 @@ def db_execute(sql, params=(), fetch_one=False, fetch_all=False, commit=False):
 
         return result
     except sqlite3.Error as e:
-        logger.error(f"Database error executing SQL: {sql} | Params: {params} | Error: {e}", exc_info=True)
+        # Improved error logging
+        logger.error(f"Database error: {e.__class__.__name__} occurred while executing SQL.")
+        logger.error(f"SQL: {sql}")
+        logger.error(f"Params: {params}")
+        logger.exception("Database error traceback:") # Log full traceback
         if conn and commit: # Only rollback if it was a commit operation that failed
-            conn.rollback()
+            try:
+                conn.rollback()
+                logger.info("Transaction rolled back due to error.")
+            except sqlite3.Error as rb_err:
+                logger.error(f"Error during rollback: {rb_err}")
         # Re-raise or return None/False depending on desired error handling
-        raise # Re-raise by default to make errors visible
+        raise # Re-raise by default to make errors visible in command handlers
     finally:
+        if cursor:
+            cursor.close()
         if conn:
             conn.close()
 
@@ -360,7 +375,7 @@ def update_leaderboard(user_id: str, points_change: int = 0, correct_answer: boo
 
     new_total_correct = (result[2] if result else 0) + (1 if correct_answer else 0)
     new_highest_streak = max(result[1] if result else 0, current_streak)
-    new_points = (result[0] if result else 0) + points_change
+    new_points = max(0, (result[0] if result else 0) + points_change) # Ensure points don't go below 0
 
     sql = """
         INSERT INTO leaderboard (user_id, points, highest_streak, total_correct, last_active)
@@ -376,7 +391,7 @@ def update_leaderboard(user_id: str, points_change: int = 0, correct_answer: boo
 
     try:
         db_execute(sql, params, commit=True)
-        logger.debug(f"Leaderboard updated for {user_id_str}: pts_change={points_change}, correct={correct_answer}, streak={current_streak}")
+        logger.debug(f"Leaderboard updated for {user_id_str}: pts_change={points_change}, correct={correct_answer}, streak={current_streak}, new_pts={new_points}")
     except Exception as e:
          # Error already logged by db_execute
          logger.error(f"Failed to update leaderboard for {user_id_str} due to DB error.")
@@ -412,11 +427,14 @@ def is_answer_correct(user_answer: str, correct_answer_str: str, tolerance=1e-6)
 
     # 2. Try numerical comparison (for single answers or if direct match failed)
     try:
-        user_num = float(user_ans_norm)
+        # Handle potential commas in user input for numbers
+        user_num_str = user_ans_norm.replace(',', '')
+        user_num = float(user_num_str)
         # Check against all possible answers if they are numeric
         for possible in possible_answers:
             try:
-                correct_num = float(possible)
+                correct_num_str = possible.replace(',', '')
+                correct_num = float(correct_num_str)
                 if math.isclose(user_num, correct_num, rel_tol=tolerance, abs_tol=tolerance):
                     return True
             except ValueError:
@@ -439,7 +457,6 @@ def is_answer_correct(user_answer: str, correct_answer_str: str, tolerance=1e-6)
             if any(c.isalpha() for c in possible) or any(c in possible for c in '()^*/+-='):
                  looks_algebraic_correct = True
                  algebraic_possible_answers.add(possible)
-                 # break # No need to break, check all algebraic ones
 
         if looks_algebraic_user and looks_algebraic_correct:
             # Check against all *algebraic* possible answers using Sympy
@@ -452,17 +469,18 @@ def is_answer_correct(user_answer: str, correct_answer_str: str, tolerance=1e-6)
 
                      # Check for simple equations like x=5
                      if '=' in user_expr_sympy_str and '=' in possible_expr_sympy_str:
-                         # Split sides and compare? Could be complex (e.g., 2x=10 vs x=5)
                          # Basic check: are they literally the same after normalization?
                          if user_expr_sympy_str == possible_expr_sympy_str:
                               return True
                          # Try parsing as Eq objects
                          try:
+                             # Use transformations='all' for robust parsing
                              sym_user_eq = sp.parse_expr(user_expr_sympy_str, transformations='all', evaluate=False)
                              sym_correct_eq = sp.parse_expr(possible_expr_sympy_str, transformations='all', evaluate=False)
                              if isinstance(sym_user_eq, sp.Equality) and isinstance(sym_correct_eq, sp.Equality):
                                  # Check if equations are equivalent (e.g., solve both or simplify difference)
-                                 if sp.solve(sym_user_eq) == sp.solve(sym_correct_eq): # Simple check for single variable solution
+                                 # solve() might return list, simplify difference is safer
+                                 if sp.simplify(sym_user_eq.lhs - sym_user_eq.rhs) == sp.simplify(sym_correct_eq.lhs - sym_correct_eq.rhs):
                                       return True
                          except (sp.SympifyError, SyntaxError, TypeError, NotImplementedError):
                               pass # Ignore if Eq parsing fails
@@ -474,8 +492,13 @@ def is_answer_correct(user_answer: str, correct_answer_str: str, tolerance=1e-6)
                      sym_correct = sp.parse_expr(possible_expr_sympy_str, transformations='all', evaluate=False)
 
                      # simplify(expr1 - expr2) == 0 is a robust check for equality
-                     if sp.simplify(sym_user - sym_correct) == 0:
+                     # Use numerical check for potential float issues in sympy
+                     diff = sp.simplify(sym_user - sym_correct)
+                     if diff.is_number and math.isclose(float(diff), 0, abs_tol=tolerance):
                          return True
+                     elif diff == 0: # Handle exact zero for symbolic results
+                          return True
+
                  except (sp.SympifyError, SyntaxError, TypeError, NotImplementedError) as sym_err:
                      # Ignore if parsing or simplification fails for this specific pair
                      logger.debug(f"Sympy comparison failed for pair ('{user_ans_norm}', '{possible}'): {sym_err}")
@@ -485,7 +508,6 @@ def is_answer_correct(user_answer: str, correct_answer_str: str, tolerance=1e-6)
          pass # Fallback to string comparison
 
     # 4. Final check - if we got here, none of the flexible methods matched.
-    # The initial direct check `user_ans_norm in possible_answers` handles exact string matches.
     return False
 
 
@@ -497,6 +519,7 @@ async def on_ready():
     """Bot startup handler"""
     logger.info(f"🚀 {bot.user.name} (ID: {bot.user.id}) is online!")
     logger.info(f"Using discord.py version {discord.__version__}")
+    logger.info(f"Command prefix: '{bot.command_prefix}'")
     logger.info(f"Connected to {len(bot.guilds)} guilds.")
     # Update presence
     await bot.change_presence(activity=discord.Game(name="!help | Math Time!"))
@@ -581,7 +604,8 @@ async def solve(ctx: commands.Context, *, problem: str): # Add type hint
         ))
 
         client = openai.OpenAI(api_key=OPENAI_API_KEY)
-        response = await asyncio.to_thread( # Run blocking OpenAI call in thread
+        # Run blocking network call in executor thread
+        response = await asyncio.to_thread(
             client.chat.completions.create,
             model="gpt-3.5-turbo", # Or "gpt-4" if available/needed
             messages=[{
@@ -600,15 +624,21 @@ async def solve(ctx: commands.Context, *, problem: str): # Add type hint
             max_tokens=1200 # Limit response length
         )
 
-        answer = response.choices[0].message.content
+        answer = response.choices[0].message.content.strip()
 
         # Delete "Thinking..." message
-        if thinking_msg: await thinking_msg.delete()
+        # Use try/except as message might be deleted by user or other issues
+        try:
+            if thinking_msg: await thinking_msg.delete()
+        except discord.HTTPException:
+            logger.warning("Could not delete 'Thinking...' message.")
+
 
         # --- Send Response (Handle potential length issues) ---
         max_len = 4000 # Embed description limit is 4096, leave buffer
         base_desc = f"**Problem:**\n`{problem}`\n\n**Solution:**\n"
-        remaining_len = max_len - len(base_desc)
+        # Calculate remaining space considering the base description
+        remaining_len = max_len - (len(base_desc) + 20) # Add buffer for title/footer/etc.
 
         if len(answer) <= remaining_len:
             # Send single embed if short enough
@@ -620,49 +650,48 @@ async def solve(ctx: commands.Context, *, problem: str): # Add type hint
             )
              await ctx.send(embed=embed)
         else:
-             # Split long messages carefully
+             # Split long messages more robustly
              parts = []
-             current_part = ""
-             # Try splitting by paragraphs first, then lines
-             split_points = answer.split('\n\n') if '\n\n' in answer else answer.split('\n')
+             current_part = base_desc if not parts else ""
+             in_code_block = False
+             in_latex_block = False
 
-             for section in split_points:
-                 # Check if adding the next section exceeds max length for the *current* part
-                 # Account for title/footer/etc in the *first* embed only if needed
-                 part_limit = max_len if not parts else 4096 # Subsequent embeds have full description space
+             for line in answer.split('\n'):
+                 line_strip = line.strip()
+                 # Basic check for block start/end
+                 if line_strip.startswith("```"): in_code_block = not in_code_block
+                 if line_strip.startswith("$$"): in_latex_block = not in_latex_block
 
-                 if len(current_part) + len(section) + 2 > part_limit: # +2 for potential newlines
-                     if current_part: # Don't add empty parts
-                          parts.append(current_part.strip())
-                     # Start new part, handle case where section itself is too long
-                     if len(section) > part_limit:
-                         # Force split the overly long section
-                         chunks = [section[i:i+part_limit] for i in range(0, len(section), part_limit)]
-                         parts.extend(chunks[:-1]) # Add all but the last chunk
-                         current_part = chunks[-1] # Start next part with the last chunk
-                     else:
-                          current_part = section
+                 # Check if adding the next line exceeds length limit for the *current* part
+                 part_limit = max_len if not parts else 4096 # First part has base_desc, others don't
+
+                 if len(current_part) + len(line) + 1 > part_limit:
+                      # If current part has content, add it to parts list
+                      if current_part.strip():
+                         parts.append(current_part.strip())
+                      # Start new part with the current line
+                      current_part = line
+                      # If the line itself is too long, handle it (though max_tokens should prevent extreme cases)
+                      if len(current_part) > part_limit:
+                          logger.warning("Single line exceeds embed description limit, truncating.")
+                          current_part = current_part[:part_limit-3] + "..."
+                          parts.append(current_part)
+                          current_part = "" # Reset current part as it was fully handled
+
                  else:
-                      current_part += ("\n\n" if current_part else "") + section # Add separator if needed
+                      current_part += "\n" + line
 
-             if current_part: # Add the last part
+             if current_part.strip(): # Add the last part if it has content
                   parts.append(current_part.strip())
 
              # Send the parts
+             num_parts = len(parts)
              for i, part_content in enumerate(parts):
-                 if i == 0:
-                      title = f"💡 Math Solution (Part {i+1}/{len(parts)})"
-                      desc = base_desc + part_content
-                      embed = create_embed(
-                          title=title, description=desc, color=Color.green(), footer=f"Solved for {ctx.author.name}"
-                      )
-                 else:
-                      title = f"💡 Math Solution (Part {i+1}/{len(parts)})"
-                      embed = create_embed(title=title, description=part_content, color=Color.green())
-
-                 # Ensure description isn't somehow still too long after splitting
-                 if len(embed.description) > 4096:
-                     embed.description = embed.description[:4093] + "..."
+                 title = f"💡 Math Solution (Part {i+1}/{num_parts})"
+                 footer = f"Solved for {ctx.author.name}" if i == 0 else None
+                 embed = create_embed(
+                      title=title, description=part_content, color=Color.green(), footer=footer
+                 )
                  await ctx.send(embed=embed)
 
 
@@ -670,7 +699,7 @@ async def solve(ctx: commands.Context, *, problem: str): # Add type hint
 
     except openai.AuthenticationError:
          logger.error("OpenAI Authentication Error. Check your API Key.")
-         if thinking_msg: await thinking_msg.delete()
+         if thinking_msg: try: await thinking_msg.delete() catch: pass
          await ctx.send(embed=create_embed(
              title="❌ AI Error",
              description="Authentication failed. Please check the OpenAI API key configuration.",
@@ -678,7 +707,7 @@ async def solve(ctx: commands.Context, *, problem: str): # Add type hint
          ))
     except openai.RateLimitError:
          logger.warning("OpenAI Rate Limit Error.")
-         if thinking_msg: await thinking_msg.delete()
+         if thinking_msg: try: await thinking_msg.delete() catch: pass
          await ctx.send(embed=create_embed(
              title="❌ AI Error",
              description="The AI service is currently busy or rate limited. Please try again later.",
@@ -686,7 +715,7 @@ async def solve(ctx: commands.Context, *, problem: str): # Add type hint
          ))
     except Exception as e:
         logger.error(f"Error solving problem with OpenAI: {e}", exc_info=True)
-        if thinking_msg: await thinking_msg.delete()
+        if thinking_msg: try: await thinking_msg.delete() catch: pass
         error_embed = create_embed(
             title="❌ Error",
             description=f"Sorry, I encountered an error trying to solve that: {e}",
@@ -704,18 +733,21 @@ async def sympy_command_helper(ctx: commands.Context, operation, expression: str
         expression_sympy = expression.replace('^', '**')
         # Run potentially blocking sympy operation in executor
         loop = asyncio.get_running_loop()
+        # Use partial to pass the operation and expression
         func = functools.partial(operation, expression_sympy)
         result = await loop.run_in_executor(None, func)
-        # result = operation(expression_sympy) # Old synchronous way
+
+        # Format result - convert sympy objects to string
+        result_str = str(result)
 
         embed = create_embed(
             title=f"{title}",
-            description=f"**Original:**\n`{expression}`\n\n**{result_prefix}:**\n`{result}`",
+            description=f"**Original:**\n`{expression}`\n\n**{result_prefix}:**\n`{result_str}`",
             color=Color.blue(),
             footer=f"Calculated for {ctx.author.name}"
         )
         await ctx.send(embed=embed)
-        logger.info(f"{title} calculated for {ctx.author.id} ({ctx.author.name}): {expression} -> {result}")
+        logger.info(f"{title} calculated for {ctx.author.id} ({ctx.author.name}): {expression} -> {result_str}")
     except (sp.SympifyError, TypeError, SyntaxError) as e:
          logger.warning(f"Sympy input error ({title}) for {ctx.author.id} ({ctx.author.name}): {expression} | Error: {e}")
          error_embed = create_embed(
@@ -746,14 +778,11 @@ async def simplify(ctx: commands.Context, *, expression: str): # Add type hint
 @bot.command(name="derive", help="Calculates the derivative.\nUsage: !derive <expression> [w.r.t variable]")
 async def derive(ctx: commands.Context, *, expression: str): # Add type hint
     """Calculate derivative of expression using sympy"""
-    # Basic variable detection (optional, assumes 'x' if not specified)
-    # More complex parsing could allow specifying the variable
     await sympy_command_helper(ctx, sp.diff, expression, "📈 Derivative", "Derivative")
 
 @bot.command(name="integrate", help="Calculates the indefinite integral.\nUsage: !integrate <expression> [w.r.t variable]")
 async def integrate(ctx: commands.Context, *, expression: str): # Add type hint
     """Calculate indefinite integral of expression using sympy"""
-    # Basic variable detection (optional, assumes 'x' if not specified)
     await sympy_command_helper(ctx, sp.integrate, expression, "∫ Integral", "Integral")
 
 
@@ -763,6 +792,7 @@ async def integrate(ctx: commands.Context, *, expression: str): # Add type hint
 @bot.command(name="convert", aliases=["correct"], help="Looks up a correction.\nUsage: !convert <term>")
 async def convert(ctx: commands.Context, *, query: str): # Add type hint
     """Get a correction from the database (case-insensitive lookup)."""
+    if not query: return # Ignore empty query
     try:
         # Use LOWER() for case-insensitive matching on the 'wrong' column
         result = db_execute("SELECT correct FROM corrections WHERE LOWER(wrong) = ?", (query.lower(),), fetch_one=True)
@@ -849,6 +879,7 @@ async def learn(ctx: commands.Context, incorrect: str, correct: str): # Add type
 @commands.guild_only()
 async def unlearn(ctx: commands.Context, *, incorrect: str): # Add type hint
     """Remove a correction (case-insensitive lookup). Requires 'Manage Messages' permission."""
+    if not incorrect: return # Ignore empty input
     try:
         # Check count first
         count_result = db_execute("SELECT COUNT(*) FROM corrections WHERE LOWER(wrong) = ?", (incorrect.lower(),), fetch_one=True)
@@ -962,18 +993,17 @@ async def mathleaders(ctx: commands.Context, limit: int = 10): # Add type hint
                 if member:
                      display_name = member.display_name
                 else:
+                    # Avoid fetching too many members if list is long, maybe only fetch top N?
+                    # Let's try fetching all for now, but be aware of potential rate limits on large servers
                     try:
-                         # Avoid fetching too many members if list is long, maybe only fetch top 3?
-                         if rank <= 10: # Example limit for fetching
-                              member = await ctx.guild.fetch_member(int(user_id_str)) # Fetch if not cached & needed
-                              display_name = member.display_name
-                         else:
-                              display_name = f"User ID {user_id_str}" # Fallback for lower ranks
+                         member = await ctx.guild.fetch_member(int(user_id_str)) # Fetch if not cached
+                         display_name = member.display_name
                     except (discord.NotFound, ValueError): display_name = f"User ID {user_id_str}"
                     except discord.Forbidden: display_name = f"User ID {user_id_str} (Hidden)"
                     except Exception as e:
                         logger.warning(f"Could not fetch member {user_id_str} for leaderboard: {e}")
                         display_name = f"User ID {user_id_str}"
+
 
                 leaderboard_lines.append(
                     f"**#{rank}** {display_name} - **{points} pts** (Streak: {highest_streak})"
@@ -1115,7 +1145,9 @@ async def ocr(ctx: commands.Context, solve_directly: bool = False): # Add type h
         extracted_text = await loop.run_in_executor(None, func)
         # --- End of non-blocking execution ---
 
-        if processing_msg: await processing_msg.delete() # Delete the "Processing" message
+        try:
+            if processing_msg: await processing_msg.delete() # Delete the "Processing" message
+        except discord.HTTPException: pass # Ignore if message already deleted
 
         if not extracted_text or extracted_text.isspace():
             embed = create_embed(
@@ -1170,7 +1202,7 @@ async def ocr(ctx: commands.Context, solve_directly: bool = False): # Add type h
 
     except pytesseract.TesseractNotFoundError:
         logger.error("❌ Tesseract is not installed or not in PATH.") # Log for debugging
-        if processing_msg: await processing_msg.delete()
+        if processing_msg: try: await processing_msg.delete() except: pass
         embed = create_embed(
             title="❌ OCR Engine Error",
             description="Tesseract OCR engine not found or configured correctly on the server. Please contact the bot owner.",
@@ -1179,7 +1211,7 @@ async def ocr(ctx: commands.Context, solve_directly: bool = False): # Add type h
         await ctx.send(embed=embed)
     except Image.UnidentifiedImageError:
         logger.warning(f"OCR failed for user {ctx.author.id}: Unidentified image format.")
-        if processing_msg: await processing_msg.delete()
+        if processing_msg: try: await processing_msg.delete() except: pass
         embed = create_embed(
             title="❌ Image Format Error",
             description="Could not process the attached image. Please ensure it's a standard format (PNG, JPG, etc.) and not corrupted.",
@@ -1188,7 +1220,7 @@ async def ocr(ctx: commands.Context, solve_directly: bool = False): # Add type h
         await ctx.send(embed=embed)
     except Exception as e:
         logger.error(f"❌ OCR processing error for user {ctx.author.id}: {e}", exc_info=True) # Log full traceback
-        if processing_msg: await processing_msg.delete()
+        if processing_msg: try: await processing_msg.delete() except: pass
         embed = create_embed(
             title="❌ Error Processing Image",
             description=f"An unexpected error occurred during OCR: {e}",
@@ -1203,6 +1235,7 @@ async def ocr(ctx: commands.Context, solve_directly: bool = False): # Add type h
 async def ping(ctx: commands.Context): # Add type hint
     """Check bot latency"""
     start_time = time.monotonic()
+    # Edit initial message for more accurate REST latency measure
     message = await ctx.send(embed=create_embed(title="🏓 Pinging...", color=Color.light_grey()))
     end_time = time.monotonic()
     rest_latency = (end_time - start_time) * 1000
@@ -1211,10 +1244,14 @@ async def ping(ctx: commands.Context): # Add type hint
     embed = create_embed(
         title="🏓 Pong!",
         description=f"Websocket Latency: **{ws_latency:.2f} ms**\n"
-                    f"API (Typing) Latency: **{rest_latency:.2f} ms**", # Format to 2 decimal places
+                    f"REST Latency: **{rest_latency:.2f} ms**", # Renamed for clarity
         color=Color.teal() # Changed color
     )
-    await message.edit(embed=embed)
+    try:
+        await message.edit(embed=embed)
+    except discord.HTTPException:
+         # Message might have been deleted, send new one
+         await ctx.send(embed=embed)
 
 
 @bot.command(name="info", aliases=["about"], help="Shows information about the bot.")
@@ -1273,7 +1310,8 @@ async def clear(ctx: commands.Context, amount: int = 5): # Add type hint
         return
 
     try:
-        deleted = await ctx.channel.purge(limit=amount + 1) # +1 to delete the command message itself
+        # Use bulk=True for potentially faster deletion of recent messages
+        deleted = await ctx.channel.purge(limit=amount + 1, check=None, bulk=True)
         logger.info(f"{ctx.author} cleared {len(deleted)-1} messages in channel {ctx.channel.id} (Guild: {ctx.guild.id})")
 
         # Send confirmation message and delete after a few seconds
@@ -1326,14 +1364,14 @@ async def on_message(message: discord.Message): # Add type hint
     # AND the message doesn't look like a command already
     # (Using get_context early helps check if it's potentially a command)
     ctx_check = await bot.get_context(message)
+    # Use `bot.math_help_triggers.intersection(content_lower.split())` for word-based trigger checks?
+    # Sticking to `any` for substring check for simplicity for now.
     if not ctx_check.valid and user_id not in bot.math_answers and \
        any(trigger in content_lower for trigger in bot.math_help_triggers):
         # Check if already in math help mode
         if user_id in bot.conversation_states and bot.conversation_states[user_id].get("mode") == "math_help":
-             await message.channel.send(embed=create_embed(
-                description="You're already in math help mode! Just send your problems or type `cancel`.",
-                color=Color.orange()
-             ), delete_after=10)
+             # Don't send message if already in mode, just ignore trigger
+             # await message.channel.send(embed=create_embed(...))
              return # Already in mode, handled. Stop command processing.
 
         # Enter math help mode
@@ -1385,8 +1423,11 @@ async def on_message(message: discord.Message): # Add type hint
             points_earned = 10 + (current_streak * 2)
 
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, update_leaderboard, user_id, points_earned, True, current_streak)
-            await loop.run_in_executor(None, log_question, user_id, question_text, message.content, True)
+            # Use functools.partial to pass args to executor functions
+            update_func = functools.partial(update_leaderboard, user_id, points_earned, True, current_streak)
+            log_func = functools.partial(log_question, user_id, question_text, message.content, True)
+            await loop.run_in_executor(None, update_func)
+            await loop.run_in_executor(None, log_func)
             logger.info(f"User {user_id} ({message.author.name}) answered correctly. Streak: {current_streak}. Points: +{points_earned}")
 
             new_question, new_answer = random.choice(list(math_questions.items()))
@@ -1410,8 +1451,11 @@ async def on_message(message: discord.Message): # Add type hint
             if user_id in bot.question_streaks: del bot.question_streaks[user_id]
             points_lost = 5
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, update_leaderboard, user_id, -points_lost, False, 0)
-            await loop.run_in_executor(None, log_question, user_id, question_text, message.content, False)
+            # Use functools.partial here too
+            update_func = functools.partial(update_leaderboard, user_id, -points_lost, False, 0)
+            log_func = functools.partial(log_question, user_id, question_text, message.content, False)
+            await loop.run_in_executor(None, update_func)
+            await loop.run_in_executor(None, log_func)
             logger.info(f"User {user_id} ({message.author.name}) answered incorrectly. Streak broken. Points: -{points_lost}")
 
             del bot.math_answers[user_id] # Remove from active answers
@@ -1424,12 +1468,11 @@ async def on_message(message: discord.Message): # Add type hint
             )
             await message.channel.send(embed=embed)
 
-        return # IMPORTANT: Math quest answer handled. Stop command processing.
+        return # IMPORTANT: Math quest answer handled. Stop further processing (incl. command processing).
 
-    # 4. If none of the custom logic handlers returned, process commands.
-    # This line should now be *outside* the custom logic blocks.
-    # The bot will handle command processing implicitly after on_message finishes.
-    # We can add logging here for messages that fall through.
+    # 4. If none of the custom logic handlers returned, do nothing here.
+    #    discord.py will automatically process the message for commands
+    #    if it starts with the prefix. Log messages that fall through.
     if not ctx_check.valid: # Log only if it wasn't recognized as a command attempt initially
          logger.debug(f"Ignoring non-command/non-interactive message from {user_id}: {message.content[:50]}...")
 
@@ -1450,6 +1493,7 @@ async def solve_math_question_from_help(message: discord.Message):
         if solve_command:
             if OPENAI_API_KEY: # Check if AI is enabled
                  # Use invoke to properly handle checks, cooldowns, and error handling
+                 # This will also trigger on_command_error if solve raises an error
                  await ctx.invoke(solve_command, problem=message.content)
             else:
                  await ctx.send(embed=create_embed(
@@ -1460,12 +1504,9 @@ async def solve_math_question_from_help(message: discord.Message):
         else:
              logger.error("Could not find the 'solve' command object for help mode.")
              await message.channel.send("Internal error: Solve functionality not available.")
-    except commands.CommandInvokeError as e:
-         # If invoke causes an error, let on_command_error handle it
-         logger.debug(f"CommandInvokeError during help mode solve: {e.original}")
-         # on_command_error should catch the original error
+    # Let on_command_error handle errors raised by ctx.invoke
     except Exception as e:
-        # Catch errors during context creation or command finding
+        # Catch errors during context creation or command finding *before* invoke
         logger.error(f"Error trying to invoke solve logic from help mode: {e}", exc_info=True)
         error_embed = create_embed(
             title="❌ Error",
@@ -1504,7 +1545,9 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
         )
         # Send and delete after cooldown
         try:
-             await ctx.send(embed=embed, delete_after=error.retry_after)
+             # Only send if context message still exists
+             if ctx.message:
+                 await ctx.send(embed=embed, delete_after=error.retry_after)
         except (discord.Forbidden, discord.NotFound): pass
         except Exception as e: logger.warning(f"Failed to send/delete cooldown message: {e}")
         return # Don't log cooldowns as warnings/errors
@@ -1559,7 +1602,7 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
          embed = create_embed(title="❌ AI Error", description="OpenAI rate limited. Please try again later.", color=Color.orange())
     elif isinstance(original_error, sqlite3.Error):
          log_level = logging.ERROR
-         logger.error(f"Database error during command execution: {original_error}", exc_info=True)
+         # Error details already logged in db_execute, just show generic message
          embed = create_embed(title="❌ Database Error", description="A database error occurred while processing your command.", color=Color.dark_red())
 
     # --- Truly Unexpected Errors ---
@@ -1575,7 +1618,8 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     # --- Logging and Sending ---
     # Log the error context if it wasn't a silent error like CommandNotFound or Cooldown
     if not isinstance(error, (commands.CommandNotFound, commands.CommandOnCooldown)):
-         logger.log(log_level, f"Command error ({type(original_error).__name__}) triggered by {ctx.author} ({ctx.author.id}) in channel {ctx.channel.id} (Guild: {ctx.guild.id if ctx.guild else 'DM'}): {original_error}")
+         guild_info = f"Guild: {ctx.guild.id}" if ctx.guild else "DM"
+         logger.log(log_level, f"Command error ({type(original_error).__name__}) triggered by {ctx.author} ({ctx.author.id}) in channel {ctx.channel.id} ({guild_info}): {original_error}")
 
     # Send error message embed if created
     if embed:
@@ -1587,7 +1631,7 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
                  await ctx.author.send(f"I encountered an error trying to respond in the channel (`{ctx.channel.name}`), possibly due to missing permissions. The error was: `{type(original_error).__name__}`")
              except discord.HTTPException: pass # Ignore if DM fails too
         except Exception as e:
-             logger.error(f"Failed to send error embed: {e}")
+             logger.error(f"Failed to send error embed: {e}", exc_info=True)
 
 
 # ======================
@@ -1598,15 +1642,13 @@ if __name__ == "__main__":
         pass # Already logged and exited at the top if critical
     else:
         try:
-            logger.info("Starting Mathilda Bot...")
+            logger.info(f"Starting {bot.user.name if bot.user else 'Mathilda Bot'}...")
             # Initialize database before starting bot (ensure tables exist)
-            # Using a context manager might be better if connection was global
             try:
-                _conn, _ = init_database()
-                if _conn: _conn.close() # Close initial check connection
+                init_database() # Run initialization check
             except Exception as db_init_err:
-                logger.critical(f"❌ Halting execution due to database initialization failure: {db_init_err}")
-                exit(1)
+                 logger.critical(f"❌ Halting execution due to database initialization failure: {db_init_err}")
+                 exit(1)
 
             # Start the bot
             bot.run(DISCORD_TOKEN, log_handler=None) # Use default handling
@@ -1614,8 +1656,8 @@ if __name__ == "__main__":
         except discord.errors.LoginFailure:
             logger.critical("❌ Invalid Discord Token - Authentication failed.")
         except discord.errors.PrivilegedIntentsRequired:
-             logger.critical("❌ Privileged Intents (Members) are required but not enabled in the Developer Portal!")
-             logger.critical("   Go to your bot application -> Bot -> Privileged Gateway Intents -> Enable SERVER MEMBERS INTENT.")
+             logger.critical("❌ Privileged Intents (Members/Message Content) are required but not enabled in the Developer Portal!")
+             logger.critical("   Go to your bot application -> Bot -> Privileged Gateway Intents -> Enable SERVER MEMBERS INTENT and MESSAGE CONTENT INTENT.")
         except Exception as e:
             logger.critical(f"❌ An error occurred during bot execution: {e}", exc_info=True)
         finally:
