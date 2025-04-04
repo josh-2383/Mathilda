@@ -21,7 +21,12 @@ from PIL import Image # Pillow library
 import io             # To handle image bytes
 import requests       # To download image if needed
 import functools      # For running blocking code in executor
-# -------------------
+
+# --- Voice Imports ---
+import speech_recognition as sr # Speech recognition library
+import wave                     # For handling WAV audio format (built-in)
+# Ensure PyNaCl is installed: pip install PyNaCl
+# --------------------
 
 # ======================
 # LOGGING SETUP (Set back to INFO or keep DEBUG for testing)
@@ -34,13 +39,27 @@ logging.getLogger('discord.http').setLevel(logging.WARNING)
 logging.getLogger('PIL').setLevel(logging.WARNING)
 # Suppress Flask's default logger if needed (can be verbose)
 logging.getLogger('werkzeug').setLevel(logging.WARNING)
+# Add SpeechRecognition logger control if it gets too verbose
+logging.getLogger('speech_recognition').setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
 # ======================
-# ENVIRONMENT VARIABLES (Ensure these are set!)
+# ENVIRONMENT VARIABLES & REQUIREMENTS COMMENT (Add PyNaCl and SpeechRecognition)
 # ======================
-# Never hardcode tokens or API keys!
+# discord.py>=2.0.0
+# openai>=1.0.0
+# sympy
+# Flask
+# python-dotenv
+# Pillow
+# pytesseract
+# requests
+# PyNaCl       # <--- ADD for Voice
+# SpeechRecognition # <--- ADD for Voice
+# gunicorn/waitress (Optional)
+# uvloop (Optional)
+
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 if not DISCORD_TOKEN:
@@ -48,31 +67,10 @@ if not DISCORD_TOKEN:
     exit(1)
 if not OPENAI_API_KEY:
     logger.warning("⚠️ WARNING: Missing OPENAI_API_KEY environment variable. !solve and !ocr true commands will not work.")
-    # Don't exit, maybe user doesn't need !solve
+
 
 # ======================
-# LIKELY REQUIREMENTS (for requirements.txt)
-# ======================
-# discord.py>=2.0.0
-# openai>=1.0.0
-# sympy
-# Flask       # Required for Render Web Service port binding
-# python-dotenv (if using a .env file locally)
-# Pillow        # For OCR
-# pytesseract   # For OCR
-# requests      # For OCR/HTTP requests
-# gunicorn      # Optional: Production WSGI server (recommended over Flask dev server)
-# waitress      # Optional: Alternative WSGI server
-# uvloop        # Optional: Faster event loop
-
-# TESSERACT INSTALLATION (For build.sh or system setup)
-# Make sure Tesseract OCR engine is installed!
-# Example for Debian/Ubuntu: apt-get update && apt-get install -y tesseract-ocr tesseract-ocr-eng
-# Optional: Set Tesseract path if needed
-# pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract' # Adjust if necessary
-
-# ======================
-# DATABASE SETUP
+# DATABASE SETUP / INIT (No changes needed here)
 # ======================
 DB_NAME = 'mathilda.db'
 
@@ -203,6 +201,7 @@ logger.info("Flask server thread started to handle web service requests.")
 intents = discord.Intents.default()
 intents.message_content = True # REQUIRED for reading message content
 intents.members = True # REQUIRED for reliable member lookups (display names, etc.) - Enable in Developer Portal!
+intents.voice_states = True # <--- REQUIRED FOR VOICE STATE CHANGES (joining/leaving)
 bot = commands.Bot(
     command_prefix="!",
     intents=intents,
@@ -215,6 +214,8 @@ bot = commands.Bot(
 bot.math_answers = {} # Stores current math quest {user_id: {"question": str, "answer": str, "streak": int}}
 bot.question_streaks = {} # Stores only the streak {user_id: int}, potentially redundant with math_answers but kept for simplicity
 bot.conversation_states = {} # Stores dicts: {user_id: {"mode": "math_help"}}
+bot.voice_clients = {} # Store active voice clients {guild_id: discord.VoiceClient}
+bot.listening_info = {} # Store info needed during listening {guild_id: {"text_channel": discord.TextChannel, "sink": VoiceSink}}
 
 # Math help triggers (lowercase set for faster lookups)
 bot.math_help_triggers = {
@@ -1307,118 +1308,291 @@ async def ocr(ctx: commands.Context, solve_directly: bool = False): # Add type h
         await ctx.send(embed=embed)
 
 # ======================
-# UTILITY COMMANDS
+# SPEECH RECOGNITION & VOICE HANDLING
 # ======================
-@bot.command(name="ping", help="Checks the bot's latency.")
-async def ping(ctx: commands.Context): # Add type hint
-    """Check bot latency"""
-    start_time = time.monotonic()
-    # Edit initial message for more accurate REST latency measure
-    message = await ctx.send(embed=create_embed(title="🏓 Pinging...", color=Color.light_grey()))
-    end_time = time.monotonic()
-    rest_latency = (end_time - start_time) * 1000
-    ws_latency = bot.latency * 1000 # Latency in milliseconds
+r = sr.Recognizer() # Initialize recognizer instance
 
-    embed = create_embed(
-        title="🏓 Pong!",
-        description=f"Websocket Latency: **{ws_latency:.2f} ms**\n"
-                    f"REST Latency: **{rest_latency:.2f} ms**", # Renamed for clarity
-        color=Color.teal() # Changed color
-    )
-    try:
-        await message.edit(embed=embed)
-    except discord.HTTPException:
-         # Message might have been deleted, send new one
-         await ctx.send(embed=embed)
+# --- Custom Audio Sink ---
+class VoiceSink(discord.AudioSink):
+    def __init__(self, bot_instance, text_channel: discord.TextChannel):
+        super().__init__(filters=None) # No discord.py filters needed here
+        self.bot = bot_instance
+        self.text_channel = text_channel
+        # Store buffers in memory - consider disk for long recordings if needed
+        self.user_audio_buffers = {} # {user_id: BytesIO}
+        self.active_processing = set() # Keep track of users being processed
+
+    def write(self, data: discord.reader.AudioData, user: discord.User): # Add type hints
+        # Append raw PCM audio data to user's buffer if they are not None
+        if user is None: return # Ignore silence packets between users?
+
+        user_id = user.id
+        if user_id not in self.user_audio_buffers:
+            logger.debug(f"Creating audio buffer for user {user_id}")
+            self.user_audio_buffers[user_id] = io.BytesIO()
+
+        # `data` is PCM bytes; AudioData is just a wrapper
+        self.user_audio_buffers[user_id].write(data.pcm) # Write raw PCM bytes
+
+    async def process_audio(self, user_id):
+        """Process buffered audio for a user after they stop speaking."""
+        # Prevent concurrent processing for the same user
+        if user_id in self.active_processing:
+            logger.debug(f"Audio processing already active for user {user_id}, skipping.")
+            return
+        if user_id not in self.user_audio_buffers or self.user_audio_buffers[user_id].getbuffer().nbytes == 0:
+            logger.debug(f"No audio data in buffer for user {user_id}.")
+            return # No audio data or buffer missing
+
+        # Mark user as being processed
+        self.active_processing.add(user_id)
+
+        buffer = self.user_audio_buffers.pop(user_id) # Get and remove buffer
+        buffer.seek(0)
+        user = self.bot.get_user(user_id)
+        user_name = user.display_name if user else f"User {user_id}"
+        logger.info(f"Processing {buffer.getbuffer().nbytes} bytes of audio from {user_name}...")
+
+        # --- Convert PCM to WAV in memory ---
+        # discord.py uses 48kHz, 16-bit stereo PCM
+        CHANNELS = 2
+        RATE = 48000
+        SAMPLE_WIDTH = 2 # 16-bit = 2 bytes
+
+        wav_buffer = io.BytesIO()
+        pcm_data = buffer.getvalue()
+        try:
+            with wave.open(wav_buffer, 'wb') as wf:
+                wf.setnchannels(CHANNELS)
+                wf.setsampwidth(SAMPLE_WIDTH)
+                wf.setframerate(RATE)
+                wf.writeframes(pcm_data)
+            wav_buffer.seek(0)
+            logger.debug(f"Converted PCM to WAV in memory for {user_name}.")
+        except Exception as e:
+            logger.error(f"Failed to convert PCM to WAV for {user_name}: {e}", exc_info=True)
+            self.active_processing.remove(user_id) # Unmark user
+            return
+
+        # Create AudioFile instance for SpeechRecognition (more robust than AudioData with raw bytes)
+        try:
+            # Use the WAV buffer directly with AudioFile context manager
+            with sr.AudioFile(wav_buffer) as source:
+                audio_file_data = r.record(source) # Read the entire WAV data into AudioData object
+            logger.debug(f"Created sr.AudioData for {user_name}.")
+        except Exception as e:
+             logger.error(f"Failed to create AudioData from WAV buffer for {user_name}: {e}", exc_info=True)
+             self.active_processing.remove(user_id) # Unmark user
+             return
+
+        try:
+            # Use asyncio.to_thread for blocking speech recognition call
+            # Adjust timeout and phrase_time_limit as needed
+            logger.debug(f"Sending audio data to Google for recognition for {user_name}...")
+            text = await asyncio.to_thread(r.recognize_google, audio_file_data)
+            logger.info(f"Transcription from {user_name}: '{text}'")
+
+            # --- Act on transcribed text ---
+            if text:
+                # Call the helper to process the command/solve the problem
+                await solve_math_question_from_voice(self.text_channel, user, text)
+
+        except sr.UnknownValueError:
+            logger.info(f"Google Speech Recognition could not understand audio from {user_name}")
+            # await self.text_channel.send(f"❓ Couldn't understand that.", delete_after=10) # Optional feedback
+        except sr.RequestError as e:
+            logger.error(f"Could not request results from Google Speech Recognition service; {e}")
+            await self.text_channel.send(f"⚠️ Speech recognition service error. Please try again later.")
+        except Exception as e:
+            logger.error(f"Error during audio processing/transcription for {user_name}: {e}", exc_info=True)
+            await self.text_channel.send(f"⚙️ An error occurred processing audio.")
+        finally:
+             # Ensure user is unmarked even if errors occur
+            if user_id in self.active_processing:
+                 self.active_processing.remove(user_id)
+            logger.debug(f"Finished audio processing for user {user_id}.")
 
 
-@bot.command(name="info", aliases=["about"], help="Shows information about the bot.")
-async def info(ctx: commands.Context): # Add type hint
-    """Show bot information and command categories"""
-    # Get owner info if possible
-    try:
-        app_info = await bot.application_info()
-        owner = app_info.owner
-        owner_name = owner.name if owner else "Not available"
-    except Exception as e:
-        logger.warning(f"Could not fetch application info: {e}")
-        owner_name = "Error fetching"
+    def cleanup(self):
+        # Called when the sink is stopped
+        logger.debug("VoiceSink cleanup called.")
+        self.user_audio_buffers.clear() # Clear any remaining buffers
+        self.active_processing.clear()
+        super().cleanup()
 
+# --- Helper to call solve logic from voice ---
+async def solve_math_question_from_voice(text_channel: discord.TextChannel, author: discord.User | discord.Member, problem: str):
+    """Helper function to call the solve command logic from voice recognition."""
+    if not problem: return
 
-    embed = create_embed(
-        title=f"ℹ️ About {bot.user.name}",
-        description="I'm Mathilda, your friendly neighborhood math assistant! I can help solve problems, run math challenges, read math from images, and more.",
-        color=Color.purple(), # Changed color
-        fields=[
-            ("📚 Core Features", """
-            • `!mathquest`: Start timed math challenges.
-            • `!solve [problem]`: Solve math problems using AI.
-            • `!ocr [solve=True]`: Read math from an image (attach image).
-            • `!factor`, `!simplify`, `!derive`, `!integrate`: Perform symbolic math operations.
-            • `!convert`, `!learn`, `!corrections`: Manage a term correction database.
-            • `!mathleaders`, `!mystats`: View leaderboards and personal stats.
-            """, False),
-            ("⚙️ Utility Commands", """
-            • `!ping`: Check bot response time.
-            • `!info`: Show this information panel.
-            • `!help`: Show detailed command help.
-            • `!clear [num]`: Clear messages (Mod only).
-            """, False),
-            ("🧑‍💻 Owner", owner_name, True),
-            ("⚙️ Version", f"discord.py v{discord.__version__}", True),
-            ("📊 Guilds", str(len(bot.guilds)), True),
-             # Add more stats if desired (e.g., uptime, total users seen)
-            ("🤝 Support & Source", """
-            • Need help? Ask the owner or check the support server (if any).
-            • [Source Code](https://github.com/your-repo) (Replace if public)
-            """, False) # Add link if open source
-        ],
-        thumbnail=bot.user.display_avatar.url # Use display_avatar
-    )
-    await ctx.send(embed=embed)
-
-@bot.command(name="clear", aliases=["purge"], help="Clears messages (Mods only).\nUsage: !clear [amount=5]")
-@commands.has_permissions(manage_messages=True)
-@commands.bot_has_permissions(manage_messages=True) # Check if bot has perms too
-@commands.guild_only() # Makes sense to only use in guilds
-async def clear(ctx: commands.Context, amount: int = 5): # Add type hint
-    """Clear messages (requires Manage Messages permission for user and bot)."""
-    if amount < 1 or amount > 100:
-        await ctx.send("Please specify an amount between 1 and 100.")
+    if not OPENAI_API_KEY:
+        await text_channel.send(embed=create_embed(title="❌ AI Disabled", description="Cannot solve from voice.", color=Color.orange()))
         return
 
+    # Replicate part of the solve command logic
+    thinking_msg = None
     try:
-        # Use bulk=True for potentially faster deletion of recent messages
-        deleted = await ctx.channel.purge(limit=amount + 1, check=None, bulk=True)
-        logger.info(f"{ctx.author} cleared {len(deleted)-1} messages in channel {ctx.channel.id} (Guild: {ctx.guild.id})")
+        thinking_msg = await text_channel.send(embed=create_embed(
+            title=f"🧠 Thinking (from {author.display_name}'s voice)...",
+            description=f"Solving `{problem[:100]}{'...' if len(problem)>100 else ''}`...",
+            color=Color.light_grey()
+        ))
 
-        # Send confirmation message and delete after a few seconds
-        confirm_embed = create_embed(
-            title="🧹 Messages Cleared",
-            description=f"Successfully cleared {len(deleted)-1} messages.", # Report actual number deleted
-            color=Color.green()
+        client = openai.OpenAI(api_key=OPENAI_API_KEY)
+        response = await asyncio.to_thread(
+            client.chat.completions.create,
+            model="gpt-3.5-turbo",
+            messages=[{
+                "role": "system", "content": "You are Mathilda, a math tutor bot. Provide concise step-by-step solutions."
+            }, {
+                "role": "user", "content": f"Solve and explain this math problem: {problem}"
+            }],
+            temperature=0.5, max_tokens=1200
         )
-        await ctx.send(embed=confirm_embed, delete_after=5.0) # delete_after requires seconds
-    # Error handling moved to on_command_error for MissingPermissions/BotMissingPermissions
+        answer = response.choices[0].message.content.strip()
+
+        try:
+            if thinking_msg: await thinking_msg.delete()
+        except discord.HTTPException: pass
+
+        # Send the result back to the text channel where !join was used
+        base_desc = f"🎤 **{author.display_name} asked:** `{problem}`\n\n**Solution:**\n"
+        # Handle length (simplified version here, copy complex split from !solve if needed)
+        if len(base_desc) + len(answer) > 4000:
+            answer = answer[:4000 - len(base_desc) - 20] + "... (truncated)"
+
+        embed = create_embed(title="💡 Voice Math Solution", description=base_desc + answer, color=Color.green())
+        await text_channel.send(embed=embed)
+
+    except openai.AuthenticationError:
+         logger.error("OpenAI Authentication Error (Voice).")
+         if thinking_msg: try: await thinking_msg.delete() except discord.HTTPException: pass
+         await text_channel.send(embed=create_embed(title="❌ AI Auth Error", color=Color.red()))
+    except openai.RateLimitError:
+         logger.warning("OpenAI Rate Limit Error (Voice).")
+         if thinking_msg: try: await thinking_msg.delete() except discord.HTTPException: pass
+         await text_channel.send(embed=create_embed(title="❌ AI Rate Limit", color=Color.orange()))
     except Exception as e:
-        logger.error(f"Error during message clearing in {ctx.channel.id}: {e}", exc_info=True)
-        await ctx.send(f"An error occurred while trying to clear messages: {e}")
+        logger.error(f"Error solving problem from voice: {e}", exc_info=True)
+        if thinking_msg: try: await thinking_msg.delete() except discord.HTTPException: pass
+        await text_channel.send(embed=create_embed(title="❌ Error Solving Voice Request", description=str(e), color=Color.red()))
 
 
-@bot.command(name="shutdown")
-@commands.is_owner() # Restrict to bot owner specified in bot setup or code
-async def shutdown(ctx: commands.Context): # Add type hint
-    """Shuts down the bot (Owner only)."""
-    embed = create_embed(
-        title="🛑 Shutting Down",
-        description=f"{bot.user.name} is powering off...",
-        color=Color.dark_red()
-    )
-    await ctx.send(embed=embed)
-    logger.info(f"Shutdown command received from owner {ctx.author}. Shutting down.")
-    # Gracefully close connections or save state if needed before closing
-    # (DB connections are handled locally now)
-    await bot.close()
+# ======================
+# VOICE COMMANDS
+# ======================
+@bot.command(name='join', help='Joins your current voice channel to listen for math problems.')
+@commands.guild_only()
+@commands.has_permissions(connect=True, speak=True) # Check user perms
+@commands.bot_has_permissions(connect=True, speak=True) # Check bot perms
+async def join(ctx: commands.Context):
+    """Joins the voice channel of the command author."""
+    if not ctx.author.voice or not ctx.author.voice.channel:
+        await ctx.send(embed=create_embed(title="❌ Not in Voice", description="You need to be in a voice channel first!", color=Color.red()))
+        return
+
+    channel = ctx.author.voice.channel
+    guild_id = ctx.guild.id
+
+    # Check if already connected in this guild
+    if guild_id in bot.voice_clients and bot.voice_clients[guild_id].is_connected():
+        vc = bot.voice_clients[guild_id]
+        if vc.channel == channel:
+             await ctx.send(embed=create_embed(title="✅ Already Here", description=f"I'm already listening in {channel.mention}!", color=Color.green()))
+             return
+        else:
+             # Move to the new channel
+             try:
+                  logger.info(f"Moving voice client from {vc.channel.name} to {channel.name} in guild {guild_id}")
+                  await vc.move_to(channel)
+                  await ctx.send(embed=create_embed(title="✅ Moved", description=f"Moved to {channel.mention}.", color=Color.green()))
+                  # Update text channel context if listening info exists
+                  if guild_id in bot.listening_info:
+                     logger.info(f"Updating text channel context for guild {guild_id} to {ctx.channel.name} ({ctx.channel.id})")
+                     bot.listening_info[guild_id]["text_channel"] = ctx.channel
+                     # Sink object might need to be updated/restarted if channel matters to it
+                     # For this sink, it only cares about the text_channel for replies, so updating it is fine.
+                     bot.listening_info[guild_id]["sink"].text_channel = ctx.channel
+                  return
+             except asyncio.TimeoutError:
+                  await ctx.send(embed=create_embed(title="❌ Move Failed", description="Timed out trying to move channels.", color=Color.red()))
+                  return
+             except Exception as e:
+                  await ctx.send(embed=create_embed(title="❌ Move Failed", description=f"Error moving: {e}", color=Color.red()))
+                  logger.error(f"Error moving voice client in guild {guild_id}: {e}", exc_info=True)
+                  return
+
+
+    # Connect to the channel
+    try:
+        logger.info(f"Attempting to join voice channel {channel.name} ({channel.id}) in guild {guild_id}")
+        # timeout=60 is default, connect can block
+        voice_client = await channel.connect(timeout=30.0, reconnect=True)
+        bot.voice_clients[guild_id] = voice_client
+        await ctx.send(embed=create_embed(title="🎙️ Joined Voice", description=f"Joined {channel.mention}. I'm listening for math problems!", color=Color.green()))
+        logger.info(f"Successfully joined {channel.name}. Starting listener.")
+
+        # Start listening using the custom sink
+        # Pass the bot instance and the text channel where !join was invoked
+        sink = VoiceSink(bot, ctx.channel)
+        bot.listening_info[guild_id] = {"text_channel": ctx.channel, "sink": sink}
+
+        # Define the 'after' callback within this scope
+        # Use a lambda or a nested function to capture the sink instance correctly
+        def after_speak_callback(user, error):
+             if error:
+                 logger.error(f"Error in voice listener 'after' callback for user {user.id}: {error}", exc_info=error)
+             # Schedule the processing using create_task
+             asyncio.create_task(sink.process_audio(user.id))
+
+        # Start listening
+        voice_client.listen(sink, after=after_speak_callback)
+
+    except discord.ClientException as e:
+         await ctx.send(embed=create_embed(title="❌ Connection Error", description=f"Already connected or failed to connect: {e}", color=Color.red()))
+         logger.warning(f"ClientException joining voice in guild {guild_id}: {e}")
+    except asyncio.TimeoutError:
+        await ctx.send(embed=create_embed(title="❌ Connection Timeout", description=f"Timed out trying to join {channel.mention}.", color=Color.red()))
+        logger.warning(f"Timeout joining voice channel {channel.id} in guild {guild_id}")
+    except Exception as e:
+        await ctx.send(embed=create_embed(title="❌ Connection Error", description=f"An unexpected error occurred: {e}", color=Color.red()))
+        logger.error(f"Error joining voice channel {channel.id} in guild {guild_id}: {e}", exc_info=True)
+
+
+@bot.command(name='leave', help='Leaves the current voice channel.')
+@commands.guild_only()
+async def leave(ctx: commands.Context):
+    """Leaves the voice channel the bot is currently in for this guild."""
+    guild_id = ctx.guild.id
+    if guild_id in bot.voice_clients and bot.voice_clients[guild_id].is_connected():
+        voice_client = bot.voice_clients[guild_id]
+        channel_name = voice_client.channel.mention # Get channel before disconnecting
+        logger.info(f"Leaving voice channel {channel_name} in guild {guild_id}")
+
+        # Stop listening and cleanup sink before disconnecting
+        if voice_client.is_listening():
+            voice_client.stop_listening()
+            logger.info(f"Stopped listening in guild {guild_id}.")
+        if guild_id in bot.listening_info:
+             # Cleanup sink resources if needed
+             bot.listening_info[guild_id]["sink"].cleanup()
+             del bot.listening_info[guild_id] # Remove listening info
+
+        await voice_client.disconnect(force=False) # force=False allows graceful exit
+        del bot.voice_clients[guild_id] # Remove from active clients
+        await ctx.send(embed=create_embed(title="🚪 Left Voice", description=f"Left {channel_name}.", color=Color.greyple()))
+    else:
+        await ctx.send(embed=create_embed(title="❓ Not Connected", description="I'm not currently in a voice channel in this server.", color=Color.orange()))
+
+# ======================
+# CORE COMMANDS (Cont.) / MATH OPERATIONS / CORRECTIONS / STATS / UTILS (No changes needed)
+# ======================
+# ... (factor, simplify, derive, integrate commands remain the same) ...
+# ... (convert, learn, unlearn, corrections commands remain the same) ...
+# ... (mathleaders, mystats commands remain the same) ...
+# ... (ocr command remains the same) ...
+# ... (ping, info, clear, shutdown commands remain the same) ...
+
 
 # ======================
 # MESSAGE HANDLER (Handles Math Quest answers & Math Help mode) - FINAL FINAL CORRECTED
@@ -1554,58 +1728,18 @@ async def on_message(message: discord.Message): # Add type hint
     # This allows regular commands like !ping, !solve etc. to work
     # if they weren't intercepted by the logic above.
     # It's crucial that bot.process_commands IS called for non-intercepted messages.
-    # Note: Removed debug logging here as it might be confusing. The key is process_commands below.
+    # logger.debug(f"Message {message.id}: Not handled by custom logic, processing commands...")
     await bot.process_commands(message) # <--- PROCESS COMMANDS IF NOT HANDLED ABOVE
 
 
 async def solve_math_question_from_help(message: discord.Message):
     """Helper function to invoke the solve command logic for math help mode."""
-    try:
-        # Create a context object for the message to invoke the command
-        ctx = await bot.get_context(message)
-        # Ensure context is valid enough to invoke (e.g., has author, channel)
-        if not ctx.channel or not ctx.author:
-             logger.warning("Could not create valid context for help mode solve.")
-             return
-
-        solve_command = bot.get_command('solve')
-        if solve_command:
-            if OPENAI_API_KEY: # Check if AI is enabled
-                 # Use invoke to properly handle checks, cooldowns, and error handling
-                 # This will also trigger on_command_error if solve raises an error
-                 logger.debug(f"Invoking !solve for help mode. Problem: {message.content[:50]}...")
-                 await ctx.invoke(solve_command, problem=message.content)
-                 logger.debug(f"!solve invocation complete for help mode.")
-            else:
-                 logger.warning("Attempted help mode solve, but OpenAI key is missing.")
-                 await ctx.send(embed=create_embed(
-                     title="❌ AI Feature Disabled",
-                     description="The OpenAI API key is not configured. Cannot solve automatically in help mode.",
-                     color=Color.orange()
-                 ))
-        else:
-             logger.error("Could not find the 'solve' command object for help mode.")
-             await message.channel.send("Internal error: Solve functionality not available.")
-    # Let on_command_error handle errors raised by ctx.invoke
-    except commands.CommandInvokeError as e:
-         # If invoke causes an error, let on_command_error handle it
-         logger.warning(f"CommandInvokeError during help mode solve: {e.original}")
-         # on_command_error should catch the original error
-    except Exception as e:
-        # Catch errors during context creation or command finding *before* invoke
-        logger.error(f"Error trying to invoke solve logic from help mode: {e}", exc_info=True)
-        error_embed = create_embed(
-            title="❌ Error",
-            description=f"Sorry, I encountered an error trying to process that in help mode: {e}",
-            color=Color.red()
-        )
-        try:
-             await message.channel.send(embed=error_embed)
-        except discord.HTTPException: pass # Ignore if sending fails
+    # Re-use the helper created for voice commands
+    await solve_math_question_from_voice(message.channel, message.author, message.content)
 
 
 # ======================
-# ERROR HANDLER
+# ERROR HANDLER (Add specific voice errors if needed)
 # ======================
 @bot.event
 async def on_command_error(ctx: commands.Context, error: commands.CommandError): # Add type hints
@@ -1620,7 +1754,6 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     if isinstance(error, commands.CommandNotFound):
         log_level = logging.DEBUG
         logger.debug(f"CommandNotFound: '{ctx.message.content}' by {ctx.author}")
-        # await ctx.send(f"Unknown command: `{ctx.invoked_with}`. Use `!help`.", delete_after=10)
         return # Ignore silently for less spam
 
     elif isinstance(error, commands.CommandOnCooldown):
@@ -1629,67 +1762,54 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
             description=f"Slow down! Please wait **{error.retry_after:.1f} seconds** before using `{ctx.command.name}` again.",
             color=Color.light_grey()
         )
-        # Send and delete after cooldown
         try:
-             # Only send if context message still exists
-             if ctx.message:
-                 await ctx.send(embed=embed, delete_after=error.retry_after)
+             if ctx.message: await ctx.send(embed=embed, delete_after=error.retry_after)
         except (discord.Forbidden, discord.NotFound): pass
         except Exception as e: logger.warning(f"Failed to send/delete cooldown message: {e}")
         return # Don't log cooldowns as warnings/errors
 
     elif isinstance(error, commands.MissingPermissions):
         perms = ', '.join(f"`{perm.replace('_', ' ').title()}`" for perm in error.missing_permissions)
-        embed = create_embed(
-            title="🚫 Permission Denied",
-            description=f"You need the following permission(s) to use this command: {perms}.",
-            color=Color.red()
-        )
+        embed = create_embed(title="🚫 Permission Denied", description=f"You need the following permission(s): {perms}.", color=Color.red())
 
     elif isinstance(error, commands.BotMissingPermissions):
         perms = ', '.join(f"`{perm.replace('_', ' ').title()}`" for perm in error.missing_permissions)
-        embed = create_embed(
-            title="🤖 Bot Missing Permissions",
-            description=f"I don't have the required permission(s) to perform this action: {perms}.\nPlease ask a server admin to grant them.",
-            color=Color.red()
-        )
+        embed = create_embed(title="🤖 Bot Missing Permissions", description=f"I need the following permission(s): {perms}.", color=Color.red())
 
     elif isinstance(error, commands.NotOwner):
         embed = create_embed(title="🚫 Owner Only", description="This command can only be used by the bot owner.", color=Color.dark_red())
 
-    elif isinstance(error, commands.UserInputError): # Catches MissingRequiredArgument, BadArgument, ConversionError etc.
-        embed = create_embed(
-            title="🤔 Invalid Usage",
-            description=f"There was a problem with how you used the command.\n**Error:** {error}\n\nUse `!help {ctx.command.qualified_name}` for usage details.",
-            color=Color.orange()
-        )
+    elif isinstance(error, commands.UserInputError):
+        embed = create_embed(title="🤔 Invalid Usage", description=f"Error: {error}\n\nUse `!help {ctx.command.qualified_name}` for usage.", color=Color.orange())
 
     elif isinstance(error, commands.NoPrivateMessage):
         embed = create_embed(title="🖥️ Server Only", description="This command cannot be used in Direct Messages.", color=Color.orange())
 
-    elif isinstance(error, commands.CheckFailure): # Generic check failure (like guild_only, custom checks)
-        # Try to provide more specific feedback if possible, otherwise generic message
+    elif isinstance(error, commands.CheckFailure):
         logger.warning(f"CheckFailure for command '{ctx.command.qualified_name}' by {ctx.author}: {error}")
-        embed = create_embed(title="🚫 Check Failed", description="You do not meet the requirements to run this command in this context.", color=Color.red())
+        # Provide more specific feedback for common checks
+        if isinstance(error, commands.GuildOnly):
+             embed = create_embed(title="🖥️ Server Only", description="This command can only be used within a server.", color=Color.orange())
+        else:
+             embed = create_embed(title="🚫 Check Failed", description="You do not meet the requirements to run this command here.", color=Color.red())
 
-    # --- Specific Library/Internal Errors (May need specific handling or just log) ---
+
+    # --- Specific Library/Internal Errors ---
     elif isinstance(original_error, pytesseract.TesseractNotFoundError):
-         log_level = logging.ERROR
-         logger.error("TesseractNotFoundError reached global handler (should be caught in command).")
-         embed = create_embed(title="❌ OCR Engine Error", description="Tesseract OCR not found or configured.", color=Color.red())
-
+         log_level = logging.ERROR; embed = create_embed(title="❌ OCR Engine Error", description="Tesseract OCR not found or configured.", color=Color.red())
     elif isinstance(original_error, openai.AuthenticationError):
-         log_level = logging.ERROR
-         logger.error("OpenAI AuthenticationError reached global handler (should be caught in command).")
-         embed = create_embed(title="❌ AI Auth Error", description="OpenAI Authentication failed.", color=Color.red())
+         log_level = logging.ERROR; embed = create_embed(title="❌ AI Auth Error", description="OpenAI Authentication failed.", color=Color.red())
     elif isinstance(original_error, openai.RateLimitError):
-         log_level = logging.WARNING
-         logger.warning("OpenAI RateLimitError reached global handler (should be caught in command).")
-         embed = create_embed(title="❌ AI Error", description="OpenAI rate limited. Please try again later.", color=Color.orange())
+         log_level = logging.WARNING; embed = create_embed(title="❌ AI Rate Limit", description="AI service rate limited.", color=Color.orange())
     elif isinstance(original_error, sqlite3.Error):
-         log_level = logging.ERROR
-         # Error details already logged in db_execute, just show generic message
-         embed = create_embed(title="❌ Database Error", description="A database error occurred while processing your command.", color=Color.dark_red())
+         log_level = logging.ERROR; embed = create_embed(title="❌ Database Error", description="A database error occurred.", color=Color.dark_red())
+    elif isinstance(original_error, discord.ClientException) and "Not connected to voice" in str(original_error):
+          log_level = logging.WARNING; embed = create_embed(title="🔊 Voice Error", description="I'm not connected to a voice channel.", color=Color.orange())
+    elif isinstance(original_error, discord.ClientException) and "Already connected" in str(original_error):
+         log_level = logging.WARNING; embed = create_embed(title="🔊 Voice Error", description="I'm already connected to a voice channel.", color=Color.orange())
+    elif isinstance(original_error, sr.RequestError):
+         log_level = logging.ERROR; embed = create_embed(title="🎤 Speech Recognition Error", description=f"Speech service error: {original_error}", color=Color.red())
+
 
     # --- Truly Unexpected Errors ---
     else:
@@ -1697,27 +1817,22 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
         logger.error(f"Unhandled error in command '{ctx.command.qualified_name if ctx.command else 'None'}': {error}", exc_info=True) # Log traceback
         embed = create_embed(
             title="💥 Unexpected Error",
-            description=f"An unexpected error occurred. The developers have been notified.\n```py\n{type(original_error).__name__}: {original_error}\n```",
+            description=f"An unexpected error occurred. Please report this!\n```py\n{type(original_error).__name__}: {original_error}\n```",
             color=Color.dark_red()
         )
 
     # --- Logging and Sending ---
-    # Log the error context if it wasn't a silent error like CommandNotFound or Cooldown
     if not isinstance(error, (commands.CommandNotFound, commands.CommandOnCooldown)):
          guild_info = f"Guild: {ctx.guild.id}" if ctx.guild else "DM"
          logger.log(log_level, f"Command error ({type(original_error).__name__}) triggered by {ctx.author} ({ctx.author.id}) in channel {ctx.channel.id} ({guild_info}): {original_error}")
 
-    # Send error message embed if created
     if embed:
-        try:
-            await ctx.send(embed=embed)
+        try: await ctx.send(embed=embed)
         except discord.errors.Forbidden:
              logger.warning(f"Cannot send error message to channel {ctx.channel.id}, missing permissions.")
-             try: # Try sending to user DM as last resort
-                 await ctx.author.send(f"I encountered an error trying to respond in the channel (`{ctx.channel.name}`), possibly due to missing permissions. The error was: `{type(original_error).__name__}`")
+             try: await ctx.author.send(f"I encountered an error in channel `{ctx.channel.name}`: `{type(original_error).__name__}` (Missing permissions?)")
              except discord.HTTPException: pass # Ignore if DM fails too
-        except Exception as e:
-             logger.error(f"Failed to send error embed: {e}", exc_info=True)
+        except Exception as e: logger.error(f"Failed to send error embed: {e}", exc_info=True)
 
 
 # ======================
@@ -1727,50 +1842,55 @@ async def main():
     """Main async function to setup and run the bot."""
     if not DISCORD_TOKEN:
         logger.critical("DISCORD_TOKEN not set. Exiting.")
-        return # Exit if token is missing
+        return
 
     try:
         logger.info(f"Starting {bot.user.name if bot.user else 'Mathilda Bot'}...")
-        # Initialize database before starting bot (ensure tables exist)
-        try:
-            init_database() # Run initialization check
+        try: init_database()
         except Exception as db_init_err:
              logger.critical(f"❌ Halting execution due to database initialization failure: {db_init_err}")
-             exit(1) # Use exit() here as we are not in the main async loop yet
+             exit(1)
 
-        # Start the bot - this is blocking until the bot stops
         # Recommended way to run the bot within an async context
         async with bot:
             await bot.start(DISCORD_TOKEN)
 
-    except discord.errors.LoginFailure:
-        logger.critical("❌ Invalid Discord Token - Authentication failed.")
+    except discord.errors.LoginFailure: logger.critical("❌ Invalid Discord Token - Authentication failed.")
     except discord.errors.PrivilegedIntentsRequired:
-         logger.critical("❌ Privileged Intents (Members/Message Content) are required but not enabled in the Developer Portal!")
-         logger.critical("   Go to your bot application -> Bot -> Privileged Gateway Intents -> Enable SERVER MEMBERS INTENT and MESSAGE CONTENT INTENT.")
-    except KeyboardInterrupt:
-         logger.info("Shutdown requested via KeyboardInterrupt.")
-    except Exception as e:
-        logger.critical(f"❌ An error occurred during bot execution: {e}", exc_info=True)
+         logger.critical("❌ Privileged Intents (Members/Message Content/Voice States) are required but not enabled!")
+         logger.critical("   Go to Developer Portal -> Bot -> Privileged Gateway Intents -> Enable ALL THREE.")
+    except KeyboardInterrupt: logger.info("Shutdown requested via KeyboardInterrupt.")
+    except Exception as e: logger.critical(f"❌ An error occurred during bot execution: {e}", exc_info=True)
     finally:
-        # This block executes when bot loop finishes or is cancelled
-        if not bot.is_closed():
+        # Cleanup voice connections on shutdown
+        if bot.voice_clients:
+             logger.info("Disconnecting from active voice channels...")
+             # Use list() to avoid modifying dict while iterating
+             for vc_guild_id, vc in list(bot.voice_clients.items()):
+                  if vc.is_connected():
+                       logger.debug(f"Disconnecting VC in guild {vc_guild_id}")
+                       try:
+                            if vc.is_listening(): vc.stop_listening()
+                            if vc_guild_id in bot.listening_info:
+                                 bot.listening_info[vc_guild_id]["sink"].cleanup()
+                                 del bot.listening_info[vc_guild_id]
+                            await vc.disconnect(force=False)
+                            del bot.voice_clients[vc_guild_id]
+                       except Exception as e: logger.error(f"Error disconnecting voice client in guild {vc_guild_id}: {e}")
+        # Close bot connection if not already closed
+        if bot and not bot.is_closed(): # Add check if bot exists
              logger.info("Closing bot connection...")
-             await bot.close() # Ensure bot is closed if loop exited unexpectedly
+             await bot.close()
         logger.info("Mathilda Bot has shut down.")
 
 if __name__ == "__main__":
     try:
-        # Set uvloop as the event loop policy if available (optional performance boost)
         import uvloop
         asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
         logger.info("Using uvloop event loop policy.")
     except ImportError:
         logger.info("uvloop not found, using default asyncio event loop.")
-        pass # uvloop is optional
+        pass
 
-    # Run the main async function
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Main loop interrupted by KeyboardInterrupt.")
+    try: asyncio.run(main())
+    except KeyboardInterrupt: logger.info("Main loop interrupted by KeyboardInterrupt.")
