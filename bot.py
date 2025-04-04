@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*- # Added for potential unicode characters in OCR
 import discord
 from discord.ext import commands
 import sqlite3
@@ -13,6 +14,14 @@ from datetime import datetime
 import time
 import logging
 import math # Added for float comparison tolerance
+
+# --- OCR Imports ---
+import pytesseract
+from PIL import Image # Pillow library
+import io             # To handle image bytes
+import requests       # To download image if needed
+import functools      # For running blocking code in executor
+# -------------------
 
 # ======================
 # LOGGING SETUP (Optional but recommended)
@@ -41,6 +50,15 @@ if not OPENAI_API_KEY:
 # sympy
 # Flask
 # python-dotenv (if using a .env file locally)
+# Pillow        # <--- ADD for OCR
+# pytesseract   # <--- ADD for OCR
+# requests      # <--- ADD for OCR (or ensure it's there)
+
+# TESSERACT INSTALLATION (For build.sh or system setup)
+# Make sure Tesseract OCR engine is installed!
+# Example for Debian/Ubuntu: apt-get update && apt-get install -y tesseract-ocr tesseract-ocr-eng
+# Optional: Set Tesseract path if needed
+# pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract' # Adjust if necessary
 
 # ======================
 # DATABASE SETUP
@@ -306,7 +324,10 @@ def is_answer_correct(user_answer: str, correct_answer_str: str, tolerance=1e-6)
     Handles case, whitespace, multiple options (' or '), floats, and basic sympy equivalence.
     """
     user_ans_norm = user_answer.lower().strip()
+    if not user_ans_norm: # Empty answer is never correct
+        return False
     correct_ans_norm = correct_answer_str.lower().strip()
+
 
     # 1. Check for multiple correct answers separated by ' or '
     possible_answers = [ans.strip() for ans in correct_ans_norm.split(' or ')]
@@ -331,30 +352,43 @@ def is_answer_correct(user_answer: str, correct_answer_str: str, tolerance=1e-6)
     # This is experimental and might be slow or error-prone
     try:
         # Heuristic: Check if answers likely contain variables or math functions
-        looks_algebraic = any(c in user_ans_norm for c in 'xyzabcdefghijklmnopqrstuvw()^*/+-') and \
-                          any(c in correct_ans_norm for c in 'xyzabcdefghijklmnopqrstuvw()^*/+-')
+        # Make more robust: check for letters and common math symbols
+        contains_letter = any(c.isalpha() for c in user_ans_norm)
+        contains_symbol = any(c in user_ans_norm for c in '()^*/+-')
+        looks_algebraic_user = contains_letter and contains_symbol
 
-        if looks_algebraic:
+        # Check if *any* of the possible answers look algebraic
+        looks_algebraic_correct = False
+        for possible in possible_answers:
+            if any(c.isalpha() for c in possible) and any(c in possible for c in '()^*/+-'):
+                 looks_algebraic_correct = True
+                 break
+
+        if looks_algebraic_user and looks_algebraic_correct:
             # Check against all possible answers using Sympy
             for possible in possible_answers:
                  try:
                      # Use evaluate=False to prevent immediate simplification like '1+1' becoming '2'
-                     sym_user = sp.parse_expr(user_ans_norm, evaluate=False)
-                     sym_correct = sp.parse_expr(possible, evaluate=False)
+                     # Replace common '^' with '**' for sympy compatibility
+                     user_expr_sympy = user_ans_norm.replace('^', '**')
+                     possible_expr_sympy = possible.replace('^', '**')
+
+                     sym_user = sp.parse_expr(user_expr_sympy, evaluate=False)
+                     sym_correct = sp.parse_expr(possible_expr_sympy, evaluate=False)
 
                      # simplify(expr1 - expr2) == 0 is a robust check for equality
                      if sp.simplify(sym_user - sym_correct) == 0:
                          return True
                  except (sp.SympifyError, SyntaxError, TypeError):
+                     # Ignore if parsing fails for this specific pair
+                     logger.debug(f"Sympy parsing failed for pair: '{user_ans_norm}', '{possible}'")
                      continue # If parsing fails for user or correct answer, skip sympy check for this pair
     except Exception as e: # Catch any unexpected sympy error
-         logger.warning(f"Sympy comparison failed: {e}")
+         logger.warning(f"Sympy comparison encountered an error: {e}")
          pass # Fallback to string comparison
 
-    # 4. Fallback: Direct string comparison (already checked for ' or ', but double check)
-    # This covers cases missed by numeric/sympy, like "1/4" or "(2, -1)"
-    # We already checked user_ans_norm against possible_answers at the start.
-    # If we reached here, none of the flexible checks worked.
+    # 4. Final check - if we got here, none of the flexible methods matched.
+    # The initial direct check `user_ans_norm in possible_answers` handles exact string matches.
     return False
 
 
@@ -456,18 +490,43 @@ async def solve(ctx, *, problem: str):
         await thinking_msg.delete()
 
         # Format response in embed
-        embed = create_embed(
-            title="💡 Math Solution",
-            description=f"**Problem:**\n{problem}\n\n**Solution:**\n{answer}",
-            color=Color.green(),
-            footer=f"Solved for {ctx.author.name}"
-        )
-        await ctx.send(embed=embed)
-        logger.info(f"Solved problem for {ctx.author.id}: {problem}")
+        # Check if answer is too long for embed description
+        if len(answer) > 3900: # Embed description limit is 4096, leave some room
+             answer_part1 = answer[:3900]
+             answer_part2 = answer[3900:]
+             embed = create_embed(
+                 title="💡 Math Solution (Part 1)",
+                 description=f"**Problem:**\n{problem}\n\n**Solution:**\n{answer_part1}",
+                 color=Color.green(),
+                 footer=f"Solved for {ctx.author.name} (continued...)"
+             )
+             await ctx.send(embed=embed)
+             # Send remaining parts
+             for i in range(0, len(answer_part2), 3900):
+                 part = answer_part2[i:i+3900]
+                 embed_cont = create_embed(
+                     title=f"💡 Math Solution (Part {i//3900 + 2})",
+                     description=part,
+                     color=Color.green()
+                 )
+                 await ctx.send(embed=embed_cont)
+
+        else:
+            embed = create_embed(
+                title="💡 Math Solution",
+                description=f"**Problem:**\n{problem}\n\n**Solution:**\n{answer}",
+                color=Color.green(),
+                footer=f"Solved for {ctx.author.name}"
+            )
+            await ctx.send(embed=embed)
+
+        logger.info(f"Solved problem for {ctx.author.id}: {problem[:50]}...") # Log snippet
 
     except openai.AuthenticationError:
          logger.error("OpenAI Authentication Error. Check your API Key.")
-         await thinking_msg.delete() # Ensure thinking message is deleted on error
+         # Delete thinking message if possible
+         try: await thinking_msg.delete()
+         except: pass
          await ctx.send(embed=create_embed(
              title="❌ AI Error",
              description="Authentication failed. Please check the OpenAI API key configuration.",
@@ -475,7 +534,9 @@ async def solve(ctx, *, problem: str):
          ))
     except Exception as e:
         logger.error(f"Error solving problem with OpenAI: {e}", exc_info=True)
-        await thinking_msg.delete() # Ensure thinking message is deleted on error
+        # Delete thinking message if possible
+        try: await thinking_msg.delete()
+        except: pass
         error_embed = create_embed(
             title="❌ Error",
             description=f"Sorry, I encountered an error trying to solve that: {e}",
@@ -489,7 +550,9 @@ async def solve(ctx, *, problem: str):
 async def sympy_command_helper(ctx, operation, expression: str, title: str, result_prefix: str):
     """Helper function for sympy commands"""
     try:
-        result = operation(expression)
+        # Replace common user inputs if needed, e.g., ^ to **
+        expression_sympy = expression.replace('^', '**')
+        result = operation(expression_sympy)
         embed = create_embed(
             title=f"{title}",
             description=f"**Original:**\n`{expression}`\n\n**{result_prefix}:**\n`{result}`",
@@ -502,7 +565,7 @@ async def sympy_command_helper(ctx, operation, expression: str, title: str, resu
          logger.warning(f"Sympy input error ({title}) for {ctx.author.id}: {expression} | Error: {e}")
          error_embed = create_embed(
              title="❌ Invalid Input",
-             description=f"Couldn't parse the expression: `{expression}`\nError: {e}\nPlease check the format.",
+             description=f"Couldn't parse the expression: `{expression}`\nError: {e}\nPlease check the format (e.g., use `*` for multiplication, `**` for powers).",
              color=Color.orange()
          )
          await ctx.send(embed=error_embed)
@@ -578,7 +641,23 @@ async def convert(ctx, *, query: str):
 async def learn(ctx, incorrect: str, correct: str):
     """Learn a new correction. Stores the original case provided."""
     user_id_str = str(ctx.author.id)
+    # Basic validation
+    if not incorrect or not correct:
+        await ctx.send("Usage: `!learn \"<wrong term>\" \"<correct term>\"` (ensure terms are quoted if they contain spaces)")
+        return
+
     try:
+        # Check if 'wrong' term already exists (case-insensitive)
+        cursor.execute("SELECT 1 FROM corrections WHERE LOWER(wrong) = ?", (incorrect.lower(),))
+        exists = cursor.fetchone()
+        if exists:
+            await ctx.send(embed=create_embed(
+                title="⚠️ Already Exists",
+                description=f"A correction for `{incorrect}` (case-insensitive) already exists. Use `!unlearn` first if you want to replace it.",
+                color=Color.orange()
+            ))
+            return
+
         # Store the terms exactly as provided by the user
         cursor.execute(
             "INSERT INTO corrections (wrong, correct, added_by) VALUES (?, ?, ?)",
@@ -599,7 +678,7 @@ async def learn(ctx, incorrect: str, correct: str):
         conn.rollback()
         error_embed = create_embed(
             title="❌ Database Error",
-            description=f"Couldn't save correction: {str(e)}\nMaybe this 'wrong' term already exists?",
+            description=f"Couldn't save correction: {str(e)}",
             color=Color.red()
         )
         await ctx.send(embed=error_embed)
@@ -609,20 +688,11 @@ async def learn(ctx, incorrect: str, correct: str):
 async def unlearn(ctx, *, incorrect: str):
     """Remove a correction (case-insensitive lookup). Requires 'Manage Messages' permission."""
     try:
-        # Use LOWER() for case-insensitive matching
-        cursor.execute("DELETE FROM corrections WHERE LOWER(wrong) = ?", (incorrect.lower(),))
-        changes = conn.total_changes
-        conn.commit()
+        # Use LOWER() for case-insensitive matching and store result before commit
+        cursor.execute("SELECT COUNT(*) FROM corrections WHERE LOWER(wrong) = ?", (incorrect.lower(),))
+        count_before = cursor.fetchone()[0]
 
-        if changes > 0:
-            embed = create_embed(
-                title="🗑️ Removed Correction",
-                description=f"Removed entry/entries matching: `{incorrect}`",
-                color=Color.green(),
-                footer=f"Action by {ctx.author.name}"
-            )
-            logger.info(f"Correction unlearned by {ctx.author.id}: '{incorrect}'")
-        else:
+        if count_before == 0:
              embed = create_embed(
                 title="❓ Correction Not Found",
                 description=f"No correction matching `{incorrect}` found to remove.",
@@ -630,7 +700,22 @@ async def unlearn(ctx, *, incorrect: str):
                  footer=f"Action by {ctx.author.name}"
             )
              logger.debug(f"Correction unlearn attempt failed (not found) by {ctx.author.id}: '{incorrect}'")
+             await ctx.send(embed=embed)
+             return
+
+        cursor.execute("DELETE FROM corrections WHERE LOWER(wrong) = ?", (incorrect.lower(),))
+        conn.commit()
+        # Verify deletion happened (optional, conn.total_changes can be tricky with concurrent ops)
+
+        embed = create_embed(
+            title="🗑️ Removed Correction",
+            description=f"Removed {count_before} entry/entries matching: `{incorrect}`",
+            color=Color.green(),
+            footer=f"Action by {ctx.author.name}"
+        )
+        logger.info(f"Correction unlearned by {ctx.author.id}: '{incorrect}' ({count_before} entries)")
         await ctx.send(embed=embed)
+
     except sqlite3.Error as e:
         logger.error(f"Database error removing correction '{incorrect}' by {ctx.author.id}: {e}")
         conn.rollback()
@@ -684,6 +769,13 @@ async def mathleaders(ctx, limit: int = 10):
     if limit > 25 or limit < 1:
         await ctx.send("Please provide a limit between 1 and 25.")
         return
+
+    # Ensure command is run in a guild context
+    if not ctx.guild:
+        logger.warning("mathleaders command used outside of a guild (in DMs?).")
+        await ctx.send("Leaderboard can only be shown in a server channel.")
+        return
+
     try:
         # Select user_id and other stats, order by points
         cursor.execute("""
@@ -700,8 +792,18 @@ async def mathleaders(ctx, limit: int = 10):
             for row in leaderboard_data:
                 user_id_str, points, highest_streak = row
                 # Try to fetch member to display name, fallback to ID
-                member = ctx.guild.get_member(int(user_id_str)) # Convert back to int for lookup
-                display_name = member.display_name if member else f"User ID {user_id_str}"
+                try:
+                    # Use fetch_member for potentially uncached members
+                    member = await ctx.guild.fetch_member(int(user_id_str))
+                    display_name = member.display_name
+                except (discord.NotFound, ValueError): # Handle invalid ID or member not found
+                    display_name = f"User ID {user_id_str}"
+                except discord.Forbidden: # Handle missing permissions
+                    display_name = f"User ID {user_id_str} (name hidden)"
+                except Exception as e: # Catch other potential errors during fetch
+                    logger.warning(f"Could not fetch member {user_id_str} for leaderboard: {e}")
+                    display_name = f"User ID {user_id_str}"
+
                 leaderboard_text.append(
                     f"**#{rank}** {display_name} - **{points} pts** (Best Streak: {highest_streak})"
                 )
@@ -727,9 +829,6 @@ async def mathleaders(ctx, limit: int = 10):
             color=Color.red()
         )
         await ctx.send(embed=error_embed)
-    except AttributeError:
-         logger.warning("AttributeError in mathleaders, likely ctx.guild is None (DM?).")
-         await ctx.send("Leaderboard can only be shown in a server channel.")
 
 
 @bot.command(name="mystats", aliases=["mstats"], help="Shows your math quest statistics.")
@@ -788,6 +887,147 @@ async def mystats(ctx):
         await ctx.send(embed=error_embed)
 
 # ======================
+# OCR COMMAND (NEW)
+# ======================
+@bot.command(name="ocr", help="Reads text from an image. Usage: !ocr [solve=False] (attach image)")
+@commands.cooldown(1, 15, commands.BucketType.user) # Cooldown: 1 use per 15 sec per user
+async def ocr(ctx, solve_directly: bool = False):
+    """
+    Reads text from an attached image using OCR.
+
+    Args:
+        solve_directly (bool): If True, attempts to solve the extracted text using the !solve command. Defaults to False.
+    """
+    if not ctx.message.attachments:
+        embed = create_embed(
+            title="❌ No Image Attached",
+            description="Please attach an image to your message when using the `!ocr` command.",
+            color=Color.red()
+        )
+        await ctx.send(embed=embed)
+        return
+
+    attachment = ctx.message.attachments[0]
+
+    # Basic check for image content type (more robust checks might be needed)
+    if not attachment.content_type or not attachment.content_type.startswith('image/'):
+        embed = create_embed(
+            title="❌ Invalid File Type",
+            description=f"Please attach a valid image file (e.g., PNG, JPG). Detected type: `{attachment.content_type}`",
+            color=Color.red()
+        )
+        await ctx.send(embed=embed)
+        return
+
+    # Check file size (optional, prevents processing huge images)
+    if attachment.size > 8_000_000: # 8 MB limit example
+        embed = create_embed(
+            title="❌ Image Too Large",
+            description=f"Please attach an image smaller than 8 MB.",
+            color=Color.red()
+        )
+        await ctx.send(embed=embed)
+        return
+
+    processing_msg = await ctx.send(embed=create_embed(
+        title="⏳ Processing Image...",
+        description="Reading text from the image, please wait.",
+        color=Color.light_grey(),
+        thumbnail=attachment.url # Show thumbnail while processing
+    ))
+
+    try:
+        # Read the image bytes from the attachment
+        image_bytes = await attachment.read()
+        img = Image.open(io.BytesIO(image_bytes))
+
+        # --- Run OCR in an executor to avoid blocking the bot ---
+        loop = asyncio.get_running_loop()
+        # Use functools.partial to pass arguments to the blocking function
+        # Specify language ('eng') - add more languages if needed and installed (e.g., 'eng+fra')
+        func = functools.partial(pytesseract.image_to_string, img, lang='eng')
+        extracted_text = await loop.run_in_executor(None, func)
+        # --- End of non-blocking execution ---
+
+        await processing_msg.delete() # Delete the "Processing" message
+
+        if not extracted_text or extracted_text.isspace():
+            embed = create_embed(
+                title="⚠️ OCR Result",
+                description="Could not detect any text in the image.",
+                color=Color.orange(),
+                thumbnail=attachment.url
+            )
+            await ctx.send(embed=embed)
+            return
+
+        extracted_text = extracted_text.strip()
+        logger.info(f"OCR successful for user {ctx.author.id}. Extracted: '{extracted_text[:100]}...'")
+
+
+        if solve_directly:
+             # Call the existing solve command's logic
+            logger.info(f"OCR -> Solving directly for user {ctx.author.id}")
+            solve_command = bot.get_command('solve')
+            if solve_command and OPENAI_API_KEY: # Ensure solve command exists and API key is present
+                 await solve_command.callback(ctx, problem=extracted_text)
+            elif not OPENAI_API_KEY:
+                 await ctx.send(embed=create_embed(
+                     title="❌ AI Feature Disabled",
+                     description="Cannot solve directly as the OpenAI API key is not configured.",
+                     color=Color.orange()
+                 ))
+            else:
+                 logger.error("Could not find the 'solve' command callback function for OCR.")
+                 await ctx.send("Internal error: Solve functionality not available.")
+
+        else:
+             # Display extracted text
+            embed = create_embed(
+                title="📄 OCR Result",
+                description=f"**Extracted Text:**\n```\n{extracted_text}\n```\n"
+                            f"You can copy this text or run `!ocr true` (with the image) to solve directly.",
+                color=Color.blue(),
+                footer=f"Requested by {ctx.author.name}",
+                thumbnail=attachment.url # Show the image thumbnail
+            )
+            # Handle potentially long text for embed description
+            if len(embed.description) > 4096:
+                 embed.description = embed.description[:4090] + "\n... (truncated)"
+            await ctx.send(embed=embed)
+
+    except pytesseract.TesseractNotFoundError:
+        logger.error("❌ Tesseract is not installed or not in PATH.") # Log for debugging
+        try: await processing_msg.delete()
+        except: pass
+        embed = create_embed(
+            title="❌ OCR Engine Error",
+            description="Tesseract OCR engine not found or configured correctly on the server. Please contact the bot owner.",
+            color=Color.red()
+        )
+        await ctx.send(embed=embed)
+    except Image.UnidentifiedImageError:
+        logger.warning(f"OCR failed for user {ctx.author.id}: Unidentified image format.")
+        try: await processing_msg.delete()
+        except: pass
+        embed = create_embed(
+            title="❌ Image Format Error",
+            description="Could not process the attached image. Please ensure it's a standard format (PNG, JPG, etc.) and not corrupted.",
+            color=Color.red()
+        )
+        await ctx.send(embed=embed)
+    except Exception as e:
+        logger.error(f"❌ OCR processing error for user {ctx.author.id}: {e}", exc_info=True) # Log full traceback
+        try: await processing_msg.delete()
+        except: pass
+        embed = create_embed(
+            title="❌ Error Processing Image",
+            description=f"An unexpected error occurred during OCR: {e}",
+            color=Color.red()
+        )
+        await ctx.send(embed=embed)
+
+# ======================
 # UTILITY COMMANDS
 # ======================
 @bot.command(name="ping", help="Checks the bot's latency.")
@@ -796,7 +1036,7 @@ async def ping(ctx):
     latency = bot.latency * 1000 # Latency in milliseconds
     embed = create_embed(
         title="🏓 Pong!",
-        description=f"Latency: {latency:.2f} ms", # Format to 2 decimal places
+        description=f"Websocket Latency: {latency:.2f} ms", # Format to 2 decimal places
         color=Color.teal() # Changed color
     )
     await ctx.send(embed=embed)
@@ -806,12 +1046,13 @@ async def info(ctx):
     """Show bot information and command categories"""
     embed = create_embed(
         title=f"ℹ️ About {bot.user.name}",
-        description="I'm Mathilda, your friendly neighborhood math assistant! I can help solve problems, run math challenges, and more.",
+        description="I'm Mathilda, your friendly neighborhood math assistant! I can help solve problems, run math challenges, read math from images, and more.",
         color=Color.purple(), # Changed color
         fields=[
             ("📚 Core Features", """
             • `!mathquest`: Start timed math challenges.
             • `!solve [problem]`: Solve math problems using AI.
+            • `!ocr [solve=True]`: Read math from an image (attach image).
             • `!factor`, `!simplify`, `!derive`, `!integrate`: Perform symbolic math operations.
             • `!convert`, `!learn`, `!corrections`: Manage a term correction database.
             • `!mathleaders`, `!mystats`: View leaderboards and personal stats.
@@ -841,16 +1082,24 @@ async def clear(ctx, amount: int = 5):
         await ctx.send("Please specify an amount between 1 and 100.")
         return
 
-    await ctx.channel.purge(limit=amount + 1) # +1 to delete the command message itself
-    logger.info(f"{ctx.author} cleared {amount} messages in channel {ctx.channel.id}")
+    try:
+        deleted = await ctx.channel.purge(limit=amount + 1) # +1 to delete the command message itself
+        logger.info(f"{ctx.author} cleared {len(deleted)-1} messages in channel {ctx.channel.id}")
 
-    # Send confirmation message and delete after a few seconds
-    confirm_embed = create_embed(
-        title="🧹 Messages Cleared",
-        description=f"Successfully cleared {amount} messages.",
-        color=Color.green()
-    )
-    msg = await ctx.send(embed=confirm_embed, delete_after=5.0) # delete_after requires seconds
+        # Send confirmation message and delete after a few seconds
+        confirm_embed = create_embed(
+            title="🧹 Messages Cleared",
+            description=f"Successfully cleared {len(deleted)-1} messages.", # Report actual number deleted
+            color=Color.green()
+        )
+        await ctx.send(embed=confirm_embed, delete_after=5.0) # delete_after requires seconds
+    except discord.Forbidden:
+        logger.warning(f"Missing permissions to clear messages in {ctx.channel.id}")
+        await ctx.send("I don't have the required permissions (`Manage Messages`) to delete messages in this channel.")
+    except Exception as e:
+        logger.error(f"Error during message clearing in {ctx.channel.id}: {e}")
+        await ctx.send(f"An error occurred while trying to clear messages: {e}")
+
 
 @bot.command(name="shutdown")
 @commands.is_owner() # Restrict to bot owner specified in bot setup or code
@@ -878,10 +1127,11 @@ async def on_message(message):
     if message.author.bot:
         return
 
-    # Ignore DMs for certain interactions if needed
-    # if isinstance(message.channel, discord.DMChannel):
-    #     # Handle DMs differently or ignore
-    #     # await bot.process_commands(message) # Still process commands if allowed in DMs
+    # Ignore DMs for certain interactions if needed (adjust as necessary)
+    # if not message.guild: # If message is not in a guild (server)
+    #     # logger.debug(f"Ignoring DM from {message.author.id}")
+    #     # Allow processing commands if desired in DMs
+    #     # await bot.process_commands(message)
     #     return
 
     ctx = await bot.get_context(message) # Get context for potential command processing
@@ -894,7 +1144,6 @@ async def on_message(message):
     if not ctx.valid and any(trigger in content_lower for trigger in bot.math_help_triggers) and user_id not in bot.math_answers:
         # Check if already in math help mode (shouldn't happen often, but safety)
         if user_id in bot.conversation_states and bot.conversation_states[user_id].get("mode") == "math_help":
-            # Maybe send a reminder they are already in help mode
              await message.channel.send(embed=create_embed(
                 description="You're already in math help mode! Just send your problems or type `cancel`.",
                 color=Color.orange()
@@ -922,7 +1171,7 @@ async def on_message(message):
             await message.channel.send(embed=create_embed(
                 title="✅ Math Help Deactivated",
                 description="Exited math help mode. You can use other commands now.",
-                color=Color.greyple()
+                color=Color.greyple() # Adjusted color
             ))
             # If we implement pausing quests, restore quest state here:
             # if "saved_mathquest" in state_data: bot.math_answers[user_id] = state_data["saved_mathquest"]
@@ -942,6 +1191,7 @@ async def on_message(message):
         question_text = question_data["question"]
         current_streak = question_data["streak"] # Streak *before* this answer
 
+        # Use the improved answer checking function
         is_correct = is_answer_correct(message.content, expected_answer)
 
         if is_correct:
@@ -955,7 +1205,11 @@ async def on_message(message):
             logger.info(f"User {user_id} answered correctly. Streak: {current_streak}. Points: +{points_earned}")
 
             # Ask next question immediately
+            # Ensure the next question isn't the same as the last one (simple check)
             new_question, new_answer = random.choice(list(math_questions.items()))
+            while new_question == question_text:
+                new_question, new_answer = random.choice(list(math_questions.items()))
+
             bot.math_answers[user_id] = {
                 "answer": new_answer,
                 "question": new_question,
@@ -977,9 +1231,8 @@ async def on_message(message):
                 del bot.question_streaks[user_id]
 
             # Calculate penalty (optional, e.g., lose points based on streak)
-            # points_lost = min(5, question_data["streak"] // 2) # Example penalty
             points_lost = 5 # Simpler fixed penalty
-            update_leaderboard(user_id, points_change=-points_lost, correct_answer=False, current_streak=0)
+            update_leaderboard(user_id, points_change=-points_lost, correct_answer=False, current_streak=0) # Pass 0 for current streak on incorrect
             log_question(user_id, question_text, message.content, False)
             logger.info(f"User {user_id} answered incorrectly. Streak broken. Points: -{points_lost}")
 
@@ -997,8 +1250,15 @@ async def on_message(message):
         return # Answer processed, stop further message handling
 
     # --- Process regular commands if none of the above handled the message ---
-    if ctx.valid:
-        logger.debug(f"Processing command for {user_id}: {message.content}")
+    # Only process if it's a valid command and not handled by other logic
+    if not ctx.valid:
+         # If the message wasn't a command, wasn't math help activation,
+         # wasn't a math help response, and wasn't a math quest answer,
+         # then do nothing further with it.
+         # logger.debug(f"Ignoring non-command message from {user_id}: {message.content[:50]}...")
+         return
+
+    logger.debug(f"Processing command for {user_id}: {message.content}")
     await bot.process_commands(message)
 
 
@@ -1008,10 +1268,18 @@ async def solve_math_question(message):
         # We need a context object to call the command
         ctx = await bot.get_context(message)
         # We directly call the function bound to the 'solve' command
-        # Ensure the 'solve' command function exists and is accessible
         solve_command = bot.get_command('solve')
         if solve_command:
-            await solve_command.callback(ctx, problem=message.content)
+            # Check if AI is enabled before attempting
+            if OPENAI_API_KEY:
+                 await solve_command.callback(ctx, problem=message.content)
+            else:
+                 # Send specific message if AI is disabled
+                 await ctx.send(embed=create_embed(
+                     title="❌ AI Feature Disabled",
+                     description="The OpenAI API key is not configured. Cannot solve automatically in help mode.",
+                     color=Color.orange()
+                 ))
         else:
              logger.error("Could not find the 'solve' command callback function.")
              await message.channel.send("Internal error: Solve functionality not available.")
@@ -1033,80 +1301,131 @@ async def on_command_error(ctx, error):
     embed = None
     log_level = logging.WARNING # Default log level for handled errors
 
+    # Check if the error originates from the original error
+    # This helps in cases where discord.py wraps errors (e.g., in CheckFailure)
+    original_error = getattr(error, "original", error)
+
     if isinstance(error, commands.CommandNotFound):
-        # Optionally send a helpful message or just ignore
-        # embed = create_embed(title="❓ Unknown Command", description=f"Command not found. Use `!help` for a list.", color=Color.orange())
-        log_level = logging.DEBUG # Don't clutter logs too much for typos
-        logger.debug(f"CommandNotFound: {ctx.message.content} by {ctx.author}")
-        return # Avoid sending embed for simple not found errors
+        log_level = logging.DEBUG
+        logger.debug(f"CommandNotFound: '{ctx.message.content}' by {ctx.author}")
+        # Optional: Send a suggestion? e.g., "Did you mean `!solve`?"
+        # await ctx.send(f"Unknown command: `{ctx.invoked_with}`. Use `!help`.", delete_after=10)
+        return # Usually best to ignore silently
 
     elif isinstance(error, commands.CommandOnCooldown):
         embed = create_embed(
             title="⏳ Command on Cooldown",
-            description=f"Please wait {error.retry_after:.1f} seconds before using `{ctx.command.name}` again.",
+            description=f"Slow down! Please wait **{error.retry_after:.1f} seconds** before using `{ctx.command.name}` again.",
             color=Color.light_grey()
         )
+        # Optional: delete the error message after cooldown expires?
+        # try: await ctx.send(embed=embed, delete_after=error.retry_after)
+        # except: await ctx.send(embed=embed) # Fallback if delete fails
+
 
     elif isinstance(error, commands.MissingPermissions):
+        perms = ', '.join(f"`{perm}`" for perm in error.missing_permissions)
         embed = create_embed(
             title="🚫 Permission Denied",
-            description=f"You don't have the required permissions (`{', '.join(error.missing_permissions)}`) to use this command.",
+            description=f"You need the following permission(s) to use this command: {perms}.",
+            color=Color.red()
+        )
+
+    elif isinstance(error, commands.BotMissingPermissions):
+        perms = ', '.join(f"`{perm}`" for perm in error.missing_permissions)
+        embed = create_embed(
+            title="🤖 Bot Missing Permissions",
+            description=f"I don't have the required permission(s) to perform this action: {perms}. Please ask a server admin to grant them.",
             color=Color.red()
         )
 
     elif isinstance(error, commands.NotOwner):
         embed = create_embed(title="🚫 Owner Only", description="This command can only be used by the bot owner.", color=Color.dark_red())
 
-    elif isinstance(error, commands.UserInputError): # Catches MissingRequiredArgument, BadArgument, etc.
+    elif isinstance(error, commands.UserInputError): # Catches MissingRequiredArgument, BadArgument, ConversionError etc.
         embed = create_embed(
             title="🤔 Invalid Usage",
-            description=f"There was a problem with how you used the command.\nError: {error}\n\nUse `!help {ctx.command.qualified_name}` for usage details.",
+            description=f"There was a problem with how you used the command.\n**Error:** {error}\n\nUse `!help {ctx.command.qualified_name}` for usage details.",
             color=Color.orange()
         )
 
     elif isinstance(error, commands.NoPrivateMessage):
         embed = create_embed(title="🖥️ Server Only", description="This command cannot be used in Direct Messages.", color=Color.orange())
 
-    elif isinstance(error, commands.CheckFailure): # Generic check failure
-        embed = create_embed(title="🚫 Check Failed", description="You do not meet the requirements to run this command.", color=Color.red())
+    elif isinstance(error, commands.GuildOnly): # Should be caught by the check itself, but safety
+         embed = create_embed(title="🖥️ Server Only", description="This command can only be used within a server.", color=Color.orange())
+
+
+    elif isinstance(error, commands.CheckFailure): # Generic check failure (like guild_only, custom checks)
+        # Try to provide more specific feedback if possible, otherwise generic message
+        embed = create_embed(title="🚫 Check Failed", description="You do not meet the requirements to run this command in this context.", color=Color.red())
+
+    # --- Specific Error Checks (e.g., from libraries) ---
+    elif isinstance(original_error, pytesseract.TesseractNotFoundError):
+         # This specific error is handled within the !ocr command now, but keep as fallback
+         log_level = logging.ERROR
+         logger.error("TesseractNotFoundError reached global handler (should be caught in command).")
+         embed = create_embed(title="❌ OCR Engine Error", description="Tesseract OCR not found or configured.", color=Color.red())
+
+    elif isinstance(original_error, openai.AuthenticationError):
+         # This specific error is handled within the !solve command now, but keep as fallback
+         log_level = logging.ERROR
+         logger.error("OpenAI AuthenticationError reached global handler (should be caught in command).")
+         embed = create_embed(title="❌ AI Auth Error", description="OpenAI Authentication failed.", color=Color.red())
 
     else:
-        # Handle unexpected errors
-        log_level = logging.ERROR # Log unexpected errors more seriously
-        logger.error(f"Unhandled error in command '{ctx.command.qualified_name if ctx.command else 'None'}': {error}", exc_info=True)
+        # Handle truly unexpected errors
+        log_level = logging.ERROR # Log unexpected errors seriously
+        logger.error(f"Unhandled error in command '{ctx.command.qualified_name if ctx.command else 'None'}': {error}", exc_info=True) # Log traceback
         embed = create_embed(
             title="💥 Unexpected Error",
-            description=f"An unexpected error occurred. The developers have been notified (hopefully!).\n```\n{type(error).__name__}: {error}\n```",
+            description=f"An unexpected error occurred. The developers have been notified.\n```py\n{type(original_error).__name__}: {original_error}\n```",
             color=Color.dark_red()
         )
 
     if embed:
         try:
+            # Send error message (don't use delete_after for most errors unless it's cooldown)
             await ctx.send(embed=embed)
         except discord.errors.Forbidden:
              logger.warning(f"Cannot send error message to channel {ctx.channel.id}, missing permissions.")
+             try: # Try sending to user DM as last resort
+                 await ctx.author.send("I encountered an error trying to respond in the channel, possibly due to missing permissions.")
+             except: pass # Ignore if DM fails too
         except Exception as e:
              logger.error(f"Failed to send error embed: {e}")
 
     # Log the original error context regardless of whether embed was sent
-    logger.log(log_level, f"Command error ({type(error).__name__}) triggered by {ctx.author} in channel {ctx.channel.id}: {error}")
+    logger.log(log_level, f"Command error ({type(original_error).__name__}) triggered by {ctx.author} ({ctx.author.id}) in channel {ctx.channel.id} (Guild: {ctx.guild.id if ctx.guild else 'DM'}): {original_error}")
 
 
 # ======================
 # BOT EXECUTION
 # ======================
 if __name__ == "__main__":
-    try:
-        logger.info("Starting Mathilda Bot...")
-        bot.run(DISCORD_TOKEN, log_handler=None) # Use default logging or configure discord.py logging separately if needed
-    except discord.errors.LoginFailure:
-        logger.critical("❌ Invalid token - please check your DISCORD_TOKEN environment variable.")
-    except Exception as e:
-        logger.critical(f"❌ An error occurred during bot execution: {e}", exc_info=True)
-    finally:
-        # This block might not execute if bot.run() encounters certain fatal errors
-        # Ensure DB connection is closed if loop ends unexpectedly
-        if conn:
-            conn.close()
-            logger.info("Database connection closed during final shutdown.")
-        logger.info("Mathilda Bot has shut down.")
+    if not DISCORD_TOKEN:
+        # Already logged and exited at the top if critical
+        pass
+    else:
+        try:
+            logger.info("Starting Mathilda Bot...")
+            # Start the bot
+            # Consider using discord.utils.setup_logging() for more advanced discord.py logging
+            bot.run(DISCORD_TOKEN, log_handler=None) # Use default handling or configure separately
+
+        except discord.errors.LoginFailure:
+            logger.critical("❌ Invalid Discord Token - Authentication failed.")
+        except discord.errors.PrivilegedIntentsRequired:
+             logger.critical("❌ Privileged Intents (Members) are required but not enabled in the Developer Portal!")
+        except Exception as e:
+            logger.critical(f"❌ An error occurred during bot execution: {e}", exc_info=True)
+        finally:
+            # This block executes when bot.run() finishes (normally or via error/shutdown)
+            # Ensure DB connection is closed if it's still open
+            if conn:
+                try:
+                    conn.close()
+                    logger.info("Database connection closed during final shutdown.")
+                except Exception as e:
+                    logger.error(f"Error closing database connection: {e}")
+            logger.info("Mathilda Bot has shut down.")
