@@ -1585,7 +1585,9 @@ async def leave(ctx: commands.Context):
              del bot.listening_info[guild_id] # Remove listening info
 
         await voice_client.disconnect(force=False) # force=False allows graceful exit
-        del bot.voice_clients[guild_id] # Remove from active clients
+        # Check if key still exists before deleting (might be removed by disconnect event handler if added later)
+        if guild_id in bot.voice_clients:
+             del bot.voice_clients[guild_id] # Remove from active clients
         await ctx.send(embed=create_embed(title="🚪 Left Voice", description=f"Left {channel_name}.", color=Color.greyple()))
     else:
         await ctx.send(embed=create_embed(title="❓ Not Connected", description="I'm not currently in a voice channel in this server.", color=Color.orange()))
@@ -1993,7 +1995,8 @@ async def main():
                                  bot.listening_info[vc_guild_id]["sink"].cleanup()
                                  del bot.listening_info[vc_guild_id]
                             await vc.disconnect(force=False)
-                            del bot.voice_clients[vc_guild_id]
+                            if vc_guild_id in bot.voice_clients: # Check if deletion happened elsewhere
+                                 del bot.voice_clients[vc_guild_id]
                        except Exception as e: logger.error(f"Error disconnecting voice client in guild {vc_guild_id}: {e}")
         # Close bot connection if not already closed
         if bot and not bot.is_closed(): # Add check if bot exists
