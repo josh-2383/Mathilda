@@ -480,7 +480,8 @@ def is_answer_correct(user_answer: str, correct_answer_str: str, tolerance=1e-6)
                              if isinstance(sym_user_eq, sp.Equality) and isinstance(sym_correct_eq, sp.Equality):
                                  # Check if equations are equivalent (e.g., solve both or simplify difference)
                                  # solve() might return list, simplify difference is safer
-                                 if sp.simplify(sym_user_eq.lhs - sym_user_eq.rhs) == sp.simplify(sym_correct_eq.lhs - sym_correct_eq.rhs):
+                                 # Check if the simplified difference of sides is zero
+                                 if sp.simplify(sym_user_eq.lhs - sym_user_eq.rhs - (sym_correct_eq.lhs - sym_correct_eq.rhs)) == 0:
                                       return True
                          except (sp.SympifyError, SyntaxError, TypeError, NotImplementedError):
                               pass # Ignore if Eq parsing fails
@@ -494,9 +495,11 @@ def is_answer_correct(user_answer: str, correct_answer_str: str, tolerance=1e-6)
                      # simplify(expr1 - expr2) == 0 is a robust check for equality
                      # Use numerical check for potential float issues in sympy
                      diff = sp.simplify(sym_user - sym_correct)
+                     # Check if difference is numerically close to zero
                      if diff.is_number and math.isclose(float(diff), 0, abs_tol=tolerance):
                          return True
-                     elif diff == 0: # Handle exact zero for symbolic results
+                     # Check if difference simplifies symbolically to zero
+                     elif diff == 0:
                           return True
 
                  except (sp.SympifyError, SyntaxError, TypeError, NotImplementedError) as sym_err:
@@ -520,6 +523,7 @@ async def on_ready():
     logger.info(f"🚀 {bot.user.name} (ID: {bot.user.id}) is online!")
     logger.info(f"Using discord.py version {discord.__version__}")
     logger.info(f"Command prefix: '{bot.command_prefix}'")
+    logger.info(f"Case Insensitive: {bot.case_insensitive}")
     logger.info(f"Connected to {len(bot.guilds)} guilds.")
     # Update presence
     await bot.change_presence(activity=discord.Game(name="!help | Math Time!"))
@@ -652,34 +656,41 @@ async def solve(ctx: commands.Context, *, problem: str): # Add type hint
         else:
              # Split long messages more robustly
              parts = []
-             current_part = base_desc if not parts else ""
-             in_code_block = False
-             in_latex_block = False
+             current_part = "" # Start with empty part
+             first_part = True # Flag for first part
 
-             for line in answer.split('\n'):
-                 line_strip = line.strip()
-                 # Basic check for block start/end
-                 if line_strip.startswith("```"): in_code_block = not in_code_block
-                 if line_strip.startswith("$$"): in_latex_block = not in_latex_block
+             # Use a more reliable splitting method if needed, e.g., textwrap
+             # Basic splitting by paragraph/line:
+             split_points = answer.split('\n\n') # Prefer splitting by paragraph
 
-                 # Check if adding the next line exceeds length limit for the *current* part
-                 part_limit = max_len if not parts else 4096 # First part has base_desc, others don't
+             for i, section in enumerate(split_points):
+                  # If a section itself is too long, split it by lines
+                  if len(section) > max_len:
+                       lines = section.split('\n')
+                       temp_section = ""
+                       for line in lines:
+                           if len(temp_section) + len(line) + 1 > max_len:
+                               split_points.insert(i + 1, temp_section) # Insert the chunk before the rest
+                               temp_section = line # Start new chunk with current line
+                           else:
+                               temp_section += ("\n" if temp_section else "") + line
+                       section = temp_section # Last chunk of the long section
+                       # Re-evaluate loop if necessary, or just continue with the chunk
 
-                 if len(current_part) + len(line) + 1 > part_limit:
-                      # If current part has content, add it to parts list
+
+                  part_limit = remaining_len if first_part else 4096 # First part has less space
+
+                  if len(current_part) + len(section) + 2 > part_limit:
+                      # Add the completed part to the list
                       if current_part.strip():
                          parts.append(current_part.strip())
-                      # Start new part with the current line
-                      current_part = line
-                      # If the line itself is too long, handle it (though max_tokens should prevent extreme cases)
-                      if len(current_part) > part_limit:
-                          logger.warning("Single line exceeds embed description limit, truncating.")
-                          current_part = current_part[:part_limit-3] + "..."
-                          parts.append(current_part)
-                          current_part = "" # Reset current part as it was fully handled
-
-                 else:
-                      current_part += "\n" + line
+                      # Start new part with the current section
+                      current_part = section
+                      first_part = False # Subsequent parts have full space
+                  else:
+                       # Add separator (paragraph or line break)
+                       sep = "\n\n" if current_part and '\n\n' in answer else "\n"
+                       current_part += (sep if current_part else "") + section
 
              if current_part.strip(): # Add the last part if it has content
                   parts.append(current_part.strip())
@@ -688,10 +699,17 @@ async def solve(ctx: commands.Context, *, problem: str): # Add type hint
              num_parts = len(parts)
              for i, part_content in enumerate(parts):
                  title = f"💡 Math Solution (Part {i+1}/{num_parts})"
-                 footer = f"Solved for {ctx.author.name}" if i == 0 else None
+                 footer = f"Solved for {ctx.author.name}" if i == num_parts - 1 else None # Footer on last part
+                 # Add base description only to the very first part
+                 desc_content = (base_desc + part_content) if i == 0 else part_content
+
                  embed = create_embed(
-                      title=title, description=part_content, color=Color.green(), footer=footer
+                      title=title, description=desc_content, color=Color.green(), footer=footer
                  )
+                 # Ensure description isn't somehow still too long after splitting
+                 if len(embed.description) > 4096:
+                      logger.warning(f"Embed part {i+1} still too long, truncating.")
+                      embed.description = embed.description[:4093] + "..."
                  await ctx.send(embed=embed)
 
 
@@ -699,7 +717,10 @@ async def solve(ctx: commands.Context, *, problem: str): # Add type hint
 
     except openai.AuthenticationError:
          logger.error("OpenAI Authentication Error. Check your API Key.")
-         if thinking_msg: try: await thinking_msg.delete() catch: pass
+         # Corrected delete attempt:
+         if thinking_msg:
+             try: await thinking_msg.delete()
+             except discord.HTTPException: pass
          await ctx.send(embed=create_embed(
              title="❌ AI Error",
              description="Authentication failed. Please check the OpenAI API key configuration.",
@@ -707,7 +728,10 @@ async def solve(ctx: commands.Context, *, problem: str): # Add type hint
          ))
     except openai.RateLimitError:
          logger.warning("OpenAI Rate Limit Error.")
-         if thinking_msg: try: await thinking_msg.delete() catch: pass
+         # Corrected delete attempt:
+         if thinking_msg:
+             try: await thinking_msg.delete()
+             except discord.HTTPException: pass
          await ctx.send(embed=create_embed(
              title="❌ AI Error",
              description="The AI service is currently busy or rate limited. Please try again later.",
@@ -715,7 +739,10 @@ async def solve(ctx: commands.Context, *, problem: str): # Add type hint
          ))
     except Exception as e:
         logger.error(f"Error solving problem with OpenAI: {e}", exc_info=True)
-        if thinking_msg: try: await thinking_msg.delete() catch: pass
+        # Corrected delete attempt:
+        if thinking_msg:
+            try: await thinking_msg.delete()
+            except discord.HTTPException: pass
         error_embed = create_embed(
             title="❌ Error",
             description=f"Sorry, I encountered an error trying to solve that: {e}",
@@ -985,25 +1012,40 @@ async def mathleaders(ctx: commands.Context, limit: int = 10): # Add type hint
         if leaderboard_data:
             leaderboard_lines = []
             rank = 1
+            member_fetch_tasks = [] # For potentially fetching members concurrently
+
+            # First pass: try getting from cache
+            cached_members = {}
+            for row in leaderboard_data:
+                 user_id_int = int(row[0])
+                 member = ctx.guild.get_member(user_id_int)
+                 if member:
+                      cached_members[user_id_int] = member.display_name
+                 else:
+                      # Schedule fetch only if not cached (and within reasonable limit)
+                      if rank <= 15: # Fetch limit to avoid too many API calls
+                           member_fetch_tasks.append(ctx.guild.fetch_member(user_id_int))
+
+            # Fetch non-cached members concurrently
+            fetched_members_results = await asyncio.gather(*member_fetch_tasks, return_exceptions=True)
+            fetched_members = {}
+            for result in fetched_members_results:
+                 if isinstance(result, discord.Member):
+                      fetched_members[result.id] = result.display_name
+                 elif isinstance(result, Exception):
+                      # Log fetch error, but don't stop the leaderboard
+                      logger.warning(f"Failed to fetch a member for leaderboard: {result}")
+
+
+            # Second pass: build the leaderboard string
+            rank = 1
             for row in leaderboard_data:
                 user_id_str, points, highest_streak = row
-                # Try to fetch member to display name, fallback to ID
-                member = ctx.guild.get_member(int(user_id_str)) # Try cache first
-                display_name = "Unknown User" # Default
-                if member:
-                     display_name = member.display_name
-                else:
-                    # Avoid fetching too many members if list is long, maybe only fetch top N?
-                    # Let's try fetching all for now, but be aware of potential rate limits on large servers
-                    try:
-                         member = await ctx.guild.fetch_member(int(user_id_str)) # Fetch if not cached
-                         display_name = member.display_name
-                    except (discord.NotFound, ValueError): display_name = f"User ID {user_id_str}"
-                    except discord.Forbidden: display_name = f"User ID {user_id_str} (Hidden)"
-                    except Exception as e:
-                        logger.warning(f"Could not fetch member {user_id_str} for leaderboard: {e}")
-                        display_name = f"User ID {user_id_str}"
+                user_id_int = int(user_id_str)
 
+                display_name = cached_members.get(user_id_int) or \
+                               fetched_members.get(user_id_int) or \
+                               f"User ID {user_id_str}" # Fallback
 
                 leaderboard_lines.append(
                     f"**#{rank}** {display_name} - **{points} pts** (Streak: {highest_streak})"
@@ -1202,7 +1244,7 @@ async def ocr(ctx: commands.Context, solve_directly: bool = False): # Add type h
 
     except pytesseract.TesseractNotFoundError:
         logger.error("❌ Tesseract is not installed or not in PATH.") # Log for debugging
-        if processing_msg: try: await processing_msg.delete() except: pass
+        if processing_msg: try: await processing_msg.delete() except discord.HTTPException: pass
         embed = create_embed(
             title="❌ OCR Engine Error",
             description="Tesseract OCR engine not found or configured correctly on the server. Please contact the bot owner.",
@@ -1211,7 +1253,7 @@ async def ocr(ctx: commands.Context, solve_directly: bool = False): # Add type h
         await ctx.send(embed=embed)
     except Image.UnidentifiedImageError:
         logger.warning(f"OCR failed for user {ctx.author.id}: Unidentified image format.")
-        if processing_msg: try: await processing_msg.delete() except: pass
+        if processing_msg: try: await processing_msg.delete() except discord.HTTPException: pass
         embed = create_embed(
             title="❌ Image Format Error",
             description="Could not process the attached image. Please ensure it's a standard format (PNG, JPG, etc.) and not corrupted.",
@@ -1220,7 +1262,7 @@ async def ocr(ctx: commands.Context, solve_directly: bool = False): # Add type h
         await ctx.send(embed=embed)
     except Exception as e:
         logger.error(f"❌ OCR processing error for user {ctx.author.id}: {e}", exc_info=True) # Log full traceback
-        if processing_msg: try: await processing_msg.delete() except: pass
+        if processing_msg: try: await processing_msg.delete() except discord.HTTPException: pass
         embed = create_embed(
             title="❌ Error Processing Image",
             description=f"An unexpected error occurred during OCR: {e}",
@@ -1505,6 +1547,10 @@ async def solve_math_question_from_help(message: discord.Message):
              logger.error("Could not find the 'solve' command object for help mode.")
              await message.channel.send("Internal error: Solve functionality not available.")
     # Let on_command_error handle errors raised by ctx.invoke
+    except commands.CommandInvokeError as e:
+         # If invoke causes an error, let on_command_error handle it
+         logger.debug(f"CommandInvokeError during help mode solve: {e.original}")
+         # on_command_error should catch the original error
     except Exception as e:
         # Catch errors during context creation or command finding *before* invoke
         logger.error(f"Error trying to invoke solve logic from help mode: {e}", exc_info=True)
@@ -1641,6 +1687,8 @@ if __name__ == "__main__":
     if not DISCORD_TOKEN:
         pass # Already logged and exited at the top if critical
     else:
+        # Wrap bot startup in asyncio.run if needed (usually handled by bot.run)
+        # async def main(): # Example if using asyncio.run
         try:
             logger.info(f"Starting {bot.user.name if bot.user else 'Mathilda Bot'}...")
             # Initialize database before starting bot (ensure tables exist)
@@ -1650,16 +1698,24 @@ if __name__ == "__main__":
                  logger.critical(f"❌ Halting execution due to database initialization failure: {db_init_err}")
                  exit(1)
 
-            # Start the bot
-            bot.run(DISCORD_TOKEN, log_handler=None) # Use default handling
+            # Start the bot - this is blocking until the bot stops
+            await bot.start(DISCORD_TOKEN) # Use await bot.start() instead of bot.run() for better async context control
 
         except discord.errors.LoginFailure:
             logger.critical("❌ Invalid Discord Token - Authentication failed.")
         except discord.errors.PrivilegedIntentsRequired:
              logger.critical("❌ Privileged Intents (Members/Message Content) are required but not enabled in the Developer Portal!")
              logger.critical("   Go to your bot application -> Bot -> Privileged Gateway Intents -> Enable SERVER MEMBERS INTENT and MESSAGE CONTENT INTENT.")
+        except KeyboardInterrupt:
+             logger.info("Shutdown requested via KeyboardInterrupt.")
         except Exception as e:
             logger.critical(f"❌ An error occurred during bot execution: {e}", exc_info=True)
         finally:
-            # This block executes when bot.run() finishes (normally or via error/shutdown)
+            # This block executes when bot loop finishes or is cancelled
+            if not bot.is_closed():
+                 logger.info("Closing bot connection...")
+                 await bot.close() # Ensure bot is closed if loop exited unexpectedly
             logger.info("Mathilda Bot has shut down.")
+
+        # if __name__ == "__main__":
+        #     asyncio.run(main()) # Run the main async function
