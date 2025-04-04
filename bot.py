@@ -479,9 +479,9 @@ def is_answer_correct(user_answer: str, correct_answer_str: str, tolerance=1e-6)
                              sym_correct_eq = sp.parse_expr(possible_expr_sympy_str, transformations='all', evaluate=False)
                              if isinstance(sym_user_eq, sp.Equality) and isinstance(sym_correct_eq, sp.Equality):
                                  # Check if equations are equivalent (e.g., solve both or simplify difference)
-                                 # solve() might return list, simplify difference is safer
                                  # Check if the simplified difference of sides is zero
-                                 if sp.simplify(sym_user_eq.lhs - sym_user_eq.rhs - (sym_correct_eq.lhs - sym_correct_eq.rhs)) == 0:
+                                 # Use sp.expand to handle cases like 2*x = 10 vs x = 5
+                                 if sp.expand(sym_user_eq.lhs - sym_user_eq.rhs - (sym_correct_eq.lhs - sym_correct_eq.rhs)) == 0:
                                       return True
                          except (sp.SympifyError, SyntaxError, TypeError, NotImplementedError):
                               pass # Ignore if Eq parsing fails
@@ -494,7 +494,8 @@ def is_answer_correct(user_answer: str, correct_answer_str: str, tolerance=1e-6)
 
                      # simplify(expr1 - expr2) == 0 is a robust check for equality
                      # Use numerical check for potential float issues in sympy
-                     diff = sp.simplify(sym_user - sym_correct)
+                     # Use expand before simplify for better comparison
+                     diff = sp.simplify(sp.expand(sym_user - sym_correct))
                      # Check if difference is numerically close to zero
                      if diff.is_number and math.isclose(float(diff), 0, abs_tol=tolerance):
                          return True
@@ -663,23 +664,33 @@ async def solve(ctx: commands.Context, *, problem: str): # Add type hint
              # Basic splitting by paragraph/line:
              split_points = answer.split('\n\n') # Prefer splitting by paragraph
 
-             for i, section in enumerate(split_points):
+             current_section_index = 0
+             while current_section_index < len(split_points):
+                  section = split_points[current_section_index]
+                  part_limit = remaining_len if first_part else 4096
+
                   # If a section itself is too long, split it by lines
-                  if len(section) > max_len:
+                  if len(section) > part_limit:
                        lines = section.split('\n')
                        temp_section = ""
-                       for line in lines:
-                           if len(temp_section) + len(line) + 1 > max_len:
-                               split_points.insert(i + 1, temp_section) # Insert the chunk before the rest
-                               temp_section = line # Start new chunk with current line
+                       inserted = False
+                       for line_index, line in enumerate(lines):
+                           if len(temp_section) + len(line) + 1 > part_limit:
+                               # Insert the completed chunk *before* the current section index in the original list
+                               split_points.insert(current_section_index, temp_section)
+                               section = "\n".join(lines[line_index:]) # Remainder becomes the new current section
+                               inserted = True
+                               break # Move to process the newly inserted chunk
                            else:
                                temp_section += ("\n" if temp_section else "") + line
-                       section = temp_section # Last chunk of the long section
-                       # Re-evaluate loop if necessary, or just continue with the chunk
+                       if inserted:
+                           # Re-evaluate the current index as we inserted before it
+                           continue # Go back to start of while loop for the inserted section
+                       else:
+                           # Section fits even after line splitting (unlikely but possible)
+                           section = temp_section
 
-
-                  part_limit = remaining_len if first_part else 4096 # First part has less space
-
+                  # Check if adding the current section exceeds limit for the *current part being built*
                   if len(current_part) + len(section) + 2 > part_limit:
                       # Add the completed part to the list
                       if current_part.strip():
@@ -691,6 +702,9 @@ async def solve(ctx: commands.Context, *, problem: str): # Add type hint
                        # Add separator (paragraph or line break)
                        sep = "\n\n" if current_part and '\n\n' in answer else "\n"
                        current_part += (sep if current_part else "") + section
+
+                  current_section_index += 1 # Move to the next original section
+
 
              if current_part.strip(): # Add the last part if it has content
                   parts.append(current_part.strip())
@@ -1011,11 +1025,12 @@ async def mathleaders(ctx: commands.Context, limit: int = 10): # Add type hint
 
         if leaderboard_data:
             leaderboard_lines = []
-            rank = 1
             member_fetch_tasks = [] # For potentially fetching members concurrently
 
             # First pass: try getting from cache
             cached_members = {}
+            user_ids_to_fetch = []
+            rank_counter = 1
             for row in leaderboard_data:
                  user_id_int = int(row[0])
                  member = ctx.guild.get_member(user_id_int)
@@ -1023,18 +1038,26 @@ async def mathleaders(ctx: commands.Context, limit: int = 10): # Add type hint
                       cached_members[user_id_int] = member.display_name
                  else:
                       # Schedule fetch only if not cached (and within reasonable limit)
-                      if rank <= 15: # Fetch limit to avoid too many API calls
-                           member_fetch_tasks.append(ctx.guild.fetch_member(user_id_int))
+                      if rank_counter <= 15: # Fetch limit to avoid too many API calls
+                           user_ids_to_fetch.append(user_id_int)
+                 rank_counter += 1
+
 
             # Fetch non-cached members concurrently
-            fetched_members_results = await asyncio.gather(*member_fetch_tasks, return_exceptions=True)
             fetched_members = {}
-            for result in fetched_members_results:
-                 if isinstance(result, discord.Member):
-                      fetched_members[result.id] = result.display_name
-                 elif isinstance(result, Exception):
-                      # Log fetch error, but don't stop the leaderboard
-                      logger.warning(f"Failed to fetch a member for leaderboard: {result}")
+            if user_ids_to_fetch:
+                 logger.debug(f"Fetching {len(user_ids_to_fetch)} members for leaderboard.")
+                 # Using fetch_members is more efficient for multiple IDs if available
+                 # However, fetch_member in a loop with gather is also viable
+                 fetch_tasks = [ctx.guild.fetch_member(uid) for uid in user_ids_to_fetch]
+                 fetched_members_results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+
+                 for result in fetched_members_results:
+                      if isinstance(result, discord.Member):
+                           fetched_members[result.id] = result.display_name
+                      elif isinstance(result, Exception):
+                           # Log fetch error, but don't stop the leaderboard
+                           logger.warning(f"Failed to fetch a member for leaderboard: {result}")
 
 
             # Second pass: build the leaderboard string
@@ -1244,7 +1267,10 @@ async def ocr(ctx: commands.Context, solve_directly: bool = False): # Add type h
 
     except pytesseract.TesseractNotFoundError:
         logger.error("❌ Tesseract is not installed or not in PATH.") # Log for debugging
-        if processing_msg: try: await processing_msg.delete() except discord.HTTPException: pass
+        # Corrected delete attempt:
+        if processing_msg:
+            try: await processing_msg.delete()
+            except discord.HTTPException: pass
         embed = create_embed(
             title="❌ OCR Engine Error",
             description="Tesseract OCR engine not found or configured correctly on the server. Please contact the bot owner.",
@@ -1253,7 +1279,10 @@ async def ocr(ctx: commands.Context, solve_directly: bool = False): # Add type h
         await ctx.send(embed=embed)
     except Image.UnidentifiedImageError:
         logger.warning(f"OCR failed for user {ctx.author.id}: Unidentified image format.")
-        if processing_msg: try: await processing_msg.delete() except discord.HTTPException: pass
+        # Corrected delete attempt:
+        if processing_msg:
+            try: await processing_msg.delete()
+            except discord.HTTPException: pass
         embed = create_embed(
             title="❌ Image Format Error",
             description="Could not process the attached image. Please ensure it's a standard format (PNG, JPG, etc.) and not corrupted.",
@@ -1262,7 +1291,10 @@ async def ocr(ctx: commands.Context, solve_directly: bool = False): # Add type h
         await ctx.send(embed=embed)
     except Exception as e:
         logger.error(f"❌ OCR processing error for user {ctx.author.id}: {e}", exc_info=True) # Log full traceback
-        if processing_msg: try: await processing_msg.delete() except discord.HTTPException: pass
+        # Corrected delete attempt:
+        if processing_msg:
+            try: await processing_msg.delete()
+            except discord.HTTPException: pass
         embed = create_embed(
             title="❌ Error Processing Image",
             description=f"An unexpected error occurred during OCR: {e}",
@@ -1681,41 +1713,54 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
 
 
 # ======================
-# BOT EXECUTION
+# BOT EXECUTION (Using asyncio.run)
 # ======================
-if __name__ == "__main__":
+async def main():
+    """Main async function to setup and run the bot."""
     if not DISCORD_TOKEN:
-        pass # Already logged and exited at the top if critical
-    else:
-        # Wrap bot startup in asyncio.run if needed (usually handled by bot.run)
-        # async def main(): # Example if using asyncio.run
+        logger.critical("DISCORD_TOKEN not set. Exiting.")
+        return # Exit if token is missing
+
+    try:
+        logger.info(f"Starting {bot.user.name if bot.user else 'Mathilda Bot'}...")
+        # Initialize database before starting bot (ensure tables exist)
         try:
-            logger.info(f"Starting {bot.user.name if bot.user else 'Mathilda Bot'}...")
-            # Initialize database before starting bot (ensure tables exist)
-            try:
-                init_database() # Run initialization check
-            except Exception as db_init_err:
-                 logger.critical(f"❌ Halting execution due to database initialization failure: {db_init_err}")
-                 exit(1)
+            init_database() # Run initialization check
+        except Exception as db_init_err:
+             logger.critical(f"❌ Halting execution due to database initialization failure: {db_init_err}")
+             exit(1) # Use exit() here as we are not in the main async loop yet
 
-            # Start the bot - this is blocking until the bot stops
-            await bot.start(DISCORD_TOKEN) # Use await bot.start() instead of bot.run() for better async context control
+        # Start the bot - this is blocking until the bot stops
+        await bot.start(DISCORD_TOKEN)
 
-        except discord.errors.LoginFailure:
-            logger.critical("❌ Invalid Discord Token - Authentication failed.")
-        except discord.errors.PrivilegedIntentsRequired:
-             logger.critical("❌ Privileged Intents (Members/Message Content) are required but not enabled in the Developer Portal!")
-             logger.critical("   Go to your bot application -> Bot -> Privileged Gateway Intents -> Enable SERVER MEMBERS INTENT and MESSAGE CONTENT INTENT.")
-        except KeyboardInterrupt:
-             logger.info("Shutdown requested via KeyboardInterrupt.")
-        except Exception as e:
-            logger.critical(f"❌ An error occurred during bot execution: {e}", exc_info=True)
-        finally:
-            # This block executes when bot loop finishes or is cancelled
-            if not bot.is_closed():
-                 logger.info("Closing bot connection...")
-                 await bot.close() # Ensure bot is closed if loop exited unexpectedly
-            logger.info("Mathilda Bot has shut down.")
+    except discord.errors.LoginFailure:
+        logger.critical("❌ Invalid Discord Token - Authentication failed.")
+    except discord.errors.PrivilegedIntentsRequired:
+         logger.critical("❌ Privileged Intents (Members/Message Content) are required but not enabled in the Developer Portal!")
+         logger.critical("   Go to your bot application -> Bot -> Privileged Gateway Intents -> Enable SERVER MEMBERS INTENT and MESSAGE CONTENT INTENT.")
+    except KeyboardInterrupt:
+         logger.info("Shutdown requested via KeyboardInterrupt.")
+    except Exception as e:
+        logger.critical(f"❌ An error occurred during bot execution: {e}", exc_info=True)
+    finally:
+        # This block executes when bot loop finishes or is cancelled
+        if not bot.is_closed():
+             logger.info("Closing bot connection...")
+             await bot.close() # Ensure bot is closed if loop exited unexpectedly
+        logger.info("Mathilda Bot has shut down.")
 
-        # if __name__ == "__main__":
-        #     asyncio.run(main()) # Run the main async function
+if __name__ == "__main__":
+    try:
+        # Set uvloop as the event loop policy if available (optional performance boost)
+        import uvloop
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+        logger.info("Using uvloop event loop policy.")
+    except ImportError:
+        logger.info("uvloop not found, using default asyncio event loop.")
+        pass # uvloop is optional
+
+    # Run the main async function
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Main loop interrupted by KeyboardInterrupt.")
