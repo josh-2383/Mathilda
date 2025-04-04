@@ -1307,6 +1307,7 @@ async def ocr(ctx: commands.Context, solve_directly: bool = False): # Add type h
         )
         await ctx.send(embed=embed)
 
+
 # ======================
 # SPEECH RECOGNITION & VOICE HANDLING
 # ======================
@@ -1351,7 +1352,8 @@ class VoiceSink(discord.AudioSink):
         buffer.seek(0)
         user = self.bot.get_user(user_id)
         user_name = user.display_name if user else f"User {user_id}"
-        logger.info(f"Processing {buffer.getbuffer().nbytes} bytes of audio from {user_name}...")
+        audio_bytes_count = buffer.getbuffer().nbytes
+        logger.info(f"Processing {audio_bytes_count} bytes of audio from {user_name}...")
 
         # --- Convert PCM to WAV in memory ---
         # discord.py uses 48kHz, 16-bit stereo PCM
@@ -1378,6 +1380,7 @@ class VoiceSink(discord.AudioSink):
         try:
             # Use the WAV buffer directly with AudioFile context manager
             with sr.AudioFile(wav_buffer) as source:
+                # Adjust duration/timeout if needed, record might block briefly
                 audio_file_data = r.record(source) # Read the entire WAV data into AudioData object
             logger.debug(f"Created sr.AudioData for {user_name}.")
         except Exception as e:
@@ -1541,9 +1544,12 @@ async def join(ctx: commands.Context):
         # Use a lambda or a nested function to capture the sink instance correctly
         def after_speak_callback(user, error):
              if error:
-                 logger.error(f"Error in voice listener 'after' callback for user {user.id}: {error}", exc_info=error)
-             # Schedule the processing using create_task
-             asyncio.create_task(sink.process_audio(user.id))
+                 logger.error(f"Error in voice listener 'after' callback for user {user.id if user else 'Unknown'}: {error}", exc_info=error)
+             if user: # Only process if we know the user
+                  # Schedule the processing using create_task
+                  asyncio.create_task(sink.process_audio(user.id))
+             else:
+                  logger.debug("Ignoring 'after' callback with no user.")
 
         # Start listening
         voice_client.listen(sink, after=after_speak_callback)
@@ -1584,15 +1590,121 @@ async def leave(ctx: commands.Context):
     else:
         await ctx.send(embed=create_embed(title="❓ Not Connected", description="I'm not currently in a voice channel in this server.", color=Color.orange()))
 
-# ======================
-# CORE COMMANDS (Cont.) / MATH OPERATIONS / CORRECTIONS / STATS / UTILS (No changes needed)
-# ======================
-# ... (factor, simplify, derive, integrate commands remain the same) ...
-# ... (convert, learn, unlearn, corrections commands remain the same) ...
-# ... (mathleaders, mystats commands remain the same) ...
-# ... (ocr command remains the same) ...
-# ... (ping, info, clear, shutdown commands remain the same) ...
 
+# ======================
+# UTILITY COMMANDS (ping, info, clear, shutdown remain the same)
+# ======================
+@bot.command(name="ping", help="Checks the bot's latency.")
+async def ping(ctx: commands.Context): # Add type hint
+    """Check bot latency"""
+    start_time = time.monotonic()
+    # Edit initial message for more accurate REST latency measure
+    message = await ctx.send(embed=create_embed(title="🏓 Pinging...", color=Color.light_grey()))
+    end_time = time.monotonic()
+    rest_latency = (end_time - start_time) * 1000
+    ws_latency = bot.latency * 1000 # Latency in milliseconds
+
+    embed = create_embed(
+        title="🏓 Pong!",
+        description=f"Websocket Latency: **{ws_latency:.2f} ms**\n"
+                    f"REST Latency: **{rest_latency:.2f} ms**", # Renamed for clarity
+        color=Color.teal() # Changed color
+    )
+    try:
+        await message.edit(embed=embed)
+    except discord.HTTPException:
+         # Message might have been deleted, send new one
+         await ctx.send(embed=embed)
+
+
+@bot.command(name="info", aliases=["about"], help="Shows information about the bot.")
+async def info(ctx: commands.Context): # Add type hint
+    """Show bot information and command categories"""
+    # Get owner info if possible
+    try:
+        app_info = await bot.application_info()
+        owner = app_info.owner
+        owner_name = owner.name if owner else "Not available"
+    except Exception as e:
+        logger.warning(f"Could not fetch application info: {e}")
+        owner_name = "Error fetching"
+
+
+    embed = create_embed(
+        title=f"ℹ️ About {bot.user.name}",
+        description="I'm Mathilda, your friendly neighborhood math assistant! I can help solve problems, run math challenges, read math from images, and more.",
+        color=Color.purple(), # Changed color
+        fields=[
+            ("📚 Core Features", """
+            • `!mathquest`: Start timed math challenges.
+            • `!solve [problem]`: Solve math problems using AI.
+            • `!ocr [solve=True]`: Read math from an image (attach image).
+            • `!factor`, `!simplify`, `!derive`, `!integrate`: Perform symbolic math operations.
+            • `!convert`, `!learn`, `!corrections`: Manage a term correction database.
+            • `!mathleaders`, `!mystats`: View leaderboards and personal stats.
+            • `!join` / `!leave`: Join/leave voice channel for voice commands.
+            """, False),
+            ("⚙️ Utility Commands", """
+            • `!ping`: Check bot response time.
+            • `!info`: Show this information panel.
+            • `!help`: Show detailed command help.
+            • `!clear [num]`: Clear messages (Mod only).
+            """, False),
+            ("🧑‍💻 Owner", owner_name, True),
+            ("⚙️ Version", f"discord.py v{discord.__version__}", True),
+            ("📊 Guilds", str(len(bot.guilds)), True),
+             # Add more stats if desired (e.g., uptime, total users seen)
+            ("🤝 Support & Source", """
+            • Need help? Ask the owner or check the support server (if any).
+            • [Source Code](https://github.com/your-repo) (Replace if public)
+            """, False) # Add link if open source
+        ],
+        thumbnail=bot.user.display_avatar.url # Use display_avatar
+    )
+    await ctx.send(embed=embed)
+
+@bot.command(name="clear", aliases=["purge"], help="Clears messages (Mods only).\nUsage: !clear [amount=5]")
+@commands.has_permissions(manage_messages=True)
+@commands.bot_has_permissions(manage_messages=True) # Check if bot has perms too
+@commands.guild_only() # Makes sense to only use in guilds
+async def clear(ctx: commands.Context, amount: int = 5): # Add type hint
+    """Clear messages (requires Manage Messages permission for user and bot)."""
+    if amount < 1 or amount > 100:
+        await ctx.send("Please specify an amount between 1 and 100.")
+        return
+
+    try:
+        # Use bulk=True for potentially faster deletion of recent messages
+        deleted = await ctx.channel.purge(limit=amount + 1, check=None, bulk=True)
+        logger.info(f"{ctx.author} cleared {len(deleted)-1} messages in channel {ctx.channel.id} (Guild: {ctx.guild.id})")
+
+        # Send confirmation message and delete after a few seconds
+        confirm_embed = create_embed(
+            title="🧹 Messages Cleared",
+            description=f"Successfully cleared {len(deleted)-1} messages.", # Report actual number deleted
+            color=Color.green()
+        )
+        await ctx.send(embed=confirm_embed, delete_after=5.0) # delete_after requires seconds
+    # Error handling moved to on_command_error for MissingPermissions/BotMissingPermissions
+    except Exception as e:
+        logger.error(f"Error during message clearing in {ctx.channel.id}: {e}", exc_info=True)
+        await ctx.send(f"An error occurred while trying to clear messages: {e}")
+
+
+@bot.command(name="shutdown")
+@commands.is_owner() # Restrict to bot owner specified in bot setup or code
+async def shutdown(ctx: commands.Context): # Add type hint
+    """Shuts down the bot (Owner only)."""
+    embed = create_embed(
+        title="🛑 Shutting Down",
+        description=f"{bot.user.name} is powering off...",
+        color=Color.dark_red()
+    )
+    await ctx.send(embed=embed)
+    logger.info(f"Shutdown command received from owner {ctx.author}. Shutting down.")
+    # Gracefully close connections or save state if needed before closing
+    # (DB connections are handled locally now)
+    await bot.close()
 
 # ======================
 # MESSAGE HANDLER (Handles Math Quest answers & Math Help mode) - FINAL FINAL CORRECTED
@@ -1790,6 +1902,12 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
         # Provide more specific feedback for common checks
         if isinstance(error, commands.GuildOnly):
              embed = create_embed(title="🖥️ Server Only", description="This command can only be used within a server.", color=Color.orange())
+        elif isinstance(error, commands.bot_has_permissions): # Check specific type
+             perms = ', '.join(f"`{perm.replace('_', ' ').title()}`" for perm in error.missing_permissions)
+             embed = create_embed(title="🤖 Bot Missing Permissions", description=f"I need the following permission(s) to run this: {perms}.", color=Color.red())
+        elif isinstance(error, commands.has_permissions): # Check specific type
+             perms = ', '.join(f"`{perm.replace('_', ' ').title()}`" for perm in error.missing_permissions)
+             embed = create_embed(title="🚫 Permission Denied", description=f"You need the following permission(s) for this: {perms}.", color=Color.red())
         else:
              embed = create_embed(title="🚫 Check Failed", description="You do not meet the requirements to run this command here.", color=Color.red())
 
