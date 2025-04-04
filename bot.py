@@ -24,11 +24,10 @@ import functools      # For running blocking code in executor
 # -------------------
 
 # ======================
-# LOGGING SETUP (Set to DEBUG for detailed tracing)
+# LOGGING SETUP (Set back to INFO or keep DEBUG for testing)
 # ======================
 # Configure logging level and format
-# Temporarily set to DEBUG to see the detailed logs from on_message
-log_level = getattr(logging, os.environ.get('LOG_LEVEL', 'DEBUG').upper(), logging.DEBUG)
+log_level = getattr(logging, os.environ.get('LOG_LEVEL', 'INFO').upper(), logging.INFO) # Set back to INFO for production
 logging.basicConfig(level=log_level, format='%(asctime)s:%(levelname)s:%(name)s: %(message)s')
 # Set higher level for noisy libraries if desired
 logging.getLogger('discord.http').setLevel(logging.WARNING)
@@ -1422,43 +1421,35 @@ async def shutdown(ctx: commands.Context): # Add type hint
     await bot.close()
 
 # ======================
-# MESSAGE HANDLER (Handles Math Quest answers & Math Help mode) - Includes DEBUG LOGGING
+# MESSAGE HANDLER (Handles Math Quest answers & Math Help mode) - FINAL FINAL CORRECTED
 # ======================
 @bot.event
 async def on_message(message: discord.Message): # Add type hint
-    # --- START OF FUNCTION ---
-    logger.debug(f"on_message triggered for message ID {message.id} from {message.author.id} in channel {message.channel.id}")
-
     # 1. Ignore bots (including self)
     if message.author.bot:
-        logger.debug(f"Message {message.id} ignored: Author is bot.")
+        # logger.debug(f"Message {message.id} ignored: Author is bot.") # Keep logs less noisy
         return
 
-    # 2. Ignore DMs if desired
+    # 2. Ignore DMs if desired (most commands have @commands.guild_only() anyway)
     # if not message.guild:
-    #     logger.debug(f"Message {message.id} ignored: DM channel.")
     #     return
 
     # 3. Perform custom logic checks *before* command processing
     user_id = str(message.author.id) # Use string IDs
     content_lower = message.content.lower().strip() if message.content else "" # Handle potential empty content
-    logger.debug(f"Message {message.id} content (lower): '{content_lower[:50]}...'") # Log content
 
     # --- Math Help Mode Activation ---
-    ctx_check = await bot.get_context(message)
-    logger.debug(f"Message {message.id}: ctx_check.valid = {ctx_check.valid}, command = {ctx_check.command}") # Check command validity
+    ctx_check = await bot.get_context(message) # Get context once for checks
 
     is_math_help_trigger = any(trigger in content_lower for trigger in bot.math_help_triggers) if content_lower else False
     user_in_math_answers = user_id in bot.math_answers
-    logger.debug(f"Message {message.id}: is_math_help_trigger = {is_math_help_trigger}, user_in_math_answers = {user_in_math_answers}")
 
+    # Check triggers only if NOT a valid command and user is NOT already answering a math quest
     if not ctx_check.valid and not user_in_math_answers and is_math_help_trigger:
-        logger.debug(f"Message {message.id}: Entering Math Help Activation block.")
         # Check if already in math help mode
         if user_id in bot.conversation_states and bot.conversation_states[user_id].get("mode") == "math_help":
-             logger.debug(f"Message {message.id}: User already in help mode.")
-             # Don't send message, just ignore
-             return # Already in mode, handled. Stop command processing.
+             # logger.debug(f"Message {message.id}: User already in help mode.")
+             return # Already in mode, handled. Stop further processing.
 
         # Enter math help mode
         bot.conversation_states[user_id] = {"mode": "math_help"}
@@ -1471,13 +1462,13 @@ async def on_message(message: discord.Message): # Add type hint
             footer="Simply type your math query."
         )
         await message.channel.send(embed=embed)
-        return # Help mode activated, handled. Stop command processing.
+        return # Help mode activated, handled. Stop further processing.
 
     # --- Handle Messages While in Math Help Mode ---
     if user_id in bot.conversation_states and bot.conversation_states[user_id].get("mode") == "math_help":
-        logger.debug(f"Message {message.id}: Entering Math Help Response block.")
+        # logger.debug(f"Message {message.id}: Entering Math Help Response block.")
         if content_lower in ["cancel", "stop", "done", "exit"]:
-            logger.debug(f"Message {message.id}: Detected help mode cancel word.")
+            # logger.debug(f"Message {message.id}: Detected help mode cancel word.")
             del bot.conversation_states[user_id] # Exit math help mode
             logger.info(f"User {user_id} ({message.author.name}) exited math help mode.")
             await message.channel.send(embed=create_embed(
@@ -1485,17 +1476,17 @@ async def on_message(message: discord.Message): # Add type hint
                 description="Exited math help mode. You can use other commands now.",
                 color=Color.greyple() # Adjusted color
             ))
-            return # Exited help mode, handled. Stop command processing.
+            return # Exited help mode, handled. Stop further processing.
 
         # If not a cancel command, treat it as math problem
         logger.debug(f"Message {message.id}: Treating as math problem in help mode.")
         # Use a helper that invokes the !solve command correctly
         await solve_math_question_from_help(message)
-        return # Problem sent to solver, handled. Stop command processing.
+        return # Problem sent to solver, handled. Stop further processing.
 
     # --- Handle Math Quest Answers ---
     if user_id in bot.math_answers and user_id not in bot.conversation_states:
-        logger.debug(f"Message {message.id}: Entering Math Quest Answer block.")
+        # logger.debug(f"Message {message.id}: Entering Math Quest Answer block.")
         question_data = bot.math_answers[user_id]
         expected_answer = question_data["answer"]
         question_text = question_data["question"]
@@ -1503,7 +1494,7 @@ async def on_message(message: discord.Message): # Add type hint
 
         # Use the improved answer checking function
         is_correct = is_answer_correct(message.content, expected_answer)
-        logger.debug(f"Message {message.id}: Math quest answer check. Correct: {is_correct}")
+        # logger.debug(f"Message {message.id}: Math quest answer check. Correct: {is_correct}")
 
         # --- Correct Answer ---
         if is_correct:
@@ -1526,7 +1517,7 @@ async def on_message(message: discord.Message): # Add type hint
             bot.math_answers[user_id] = {
                 "answer": new_answer, "question": new_question, "streak": current_streak
             }
-            logger.debug(f"Asking next question to {user_id}. Q: {new_question[:50]}... A: {new_answer}")
+            # logger.debug(f"Asking next question to {user_id}. Q: {new_question[:50]}... A: {new_answer}")
 
             embed = create_embed(
                 title=f"✅ Correct! Streak: {current_streak}",
@@ -1559,16 +1550,12 @@ async def on_message(message: discord.Message): # Add type hint
 
         return # IMPORTANT: Math quest answer handled. Stop further processing (incl. command processing).
 
-    # 4. If none of the custom logic handlers returned, do nothing here.
-    if not ctx_check.valid:
-         logger.debug(f"Message {message.id}: Ignoring non-command/non-interactive message.")
-    else:
-         # This case should ideally not be reached if ctx_check.valid was handled implicitly
-         # If it *is* reached, it means discord.py's command processing will run.
-         logger.debug(f"Message {message.id}: Potentially passing to default command processor (ctx was valid initially).")
-
-    # --- END OF on_message FUNCTION ---
-    # No explicit bot.process_commands needed
+    # 4. If none of the custom logic handlers returned, process commands.
+    # This allows regular commands like !ping, !solve etc. to work
+    # if they weren't intercepted by the logic above.
+    # It's crucial that bot.process_commands IS called for non-intercepted messages.
+    # Note: Removed debug logging here as it might be confusing. The key is process_commands below.
+    await bot.process_commands(message) # <--- PROCESS COMMANDS IF NOT HANDLED ABOVE
 
 
 async def solve_math_question_from_help(message: discord.Message):
