@@ -24,10 +24,11 @@ import functools      # For running blocking code in executor
 # -------------------
 
 # ======================
-# LOGGING SETUP (Optional but recommended)
+# LOGGING SETUP (Set to DEBUG for detailed tracing)
 # ======================
 # Configure logging level and format
-log_level = getattr(logging, os.environ.get('LOG_LEVEL', 'INFO').upper(), logging.INFO)
+# Temporarily set to DEBUG to see the detailed logs from on_message
+log_level = getattr(logging, os.environ.get('LOG_LEVEL', 'DEBUG').upper(), logging.DEBUG)
 logging.basicConfig(level=log_level, format='%(asctime)s:%(levelname)s:%(name)s: %(message)s')
 # Set higher level for noisy libraries if desired
 logging.getLogger('discord.http').setLevel(logging.WARNING)
@@ -63,6 +64,7 @@ if not OPENAI_API_KEY:
 # requests      # For OCR/HTTP requests
 # gunicorn      # Optional: Production WSGI server (recommended over Flask dev server)
 # waitress      # Optional: Alternative WSGI server
+# uvloop        # Optional: Faster event loop
 
 # TESSERACT INSTALLATION (For build.sh or system setup)
 # Make sure Tesseract OCR engine is installed!
@@ -667,7 +669,7 @@ async def solve(ctx: commands.Context, *, problem: str): # Add type hint
              current_section_index = 0
              while current_section_index < len(split_points):
                   section = split_points[current_section_index]
-                  part_limit = remaining_len if first_part else 4096
+                  part_limit = remaining_len if first_part else 4096 # First part has less space
 
                   # If a section itself is too long, split it by lines
                   if len(section) > part_limit:
@@ -675,7 +677,9 @@ async def solve(ctx: commands.Context, *, problem: str): # Add type hint
                        temp_section = ""
                        inserted = False
                        for line_index, line in enumerate(lines):
-                           if len(temp_section) + len(line) + 1 > part_limit:
+                           # Check if adding line exceeds limit for current part (can be first or subsequent)
+                           temp_limit = remaining_len if first_part and not current_part else 4096
+                           if len(temp_section) + len(line) + 1 > temp_limit:
                                # Insert the completed chunk *before* the current section index in the original list
                                split_points.insert(current_section_index, temp_section)
                                section = "\n".join(lines[line_index:]) # Remainder becomes the new current section
@@ -691,7 +695,8 @@ async def solve(ctx: commands.Context, *, problem: str): # Add type hint
                            section = temp_section
 
                   # Check if adding the current section exceeds limit for the *current part being built*
-                  if len(current_part) + len(section) + 2 > part_limit:
+                  current_part_limit = remaining_len if first_part else 4096
+                  if len(current_part) + len(section) + 2 > current_part_limit:
                       # Add the completed part to the list
                       if current_part.strip():
                          parts.append(current_part.strip())
@@ -1417,35 +1422,42 @@ async def shutdown(ctx: commands.Context): # Add type hint
     await bot.close()
 
 # ======================
-# MESSAGE HANDLER (Handles Math Quest answers & Math Help mode) - FINAL CORRECTED
+# MESSAGE HANDLER (Handles Math Quest answers & Math Help mode) - Includes DEBUG LOGGING
 # ======================
 @bot.event
 async def on_message(message: discord.Message): # Add type hint
+    # --- START OF FUNCTION ---
+    logger.debug(f"on_message triggered for message ID {message.id} from {message.author.id} in channel {message.channel.id}")
+
     # 1. Ignore bots (including self)
     if message.author.bot:
+        logger.debug(f"Message {message.id} ignored: Author is bot.")
         return
 
-    # 2. Ignore DMs if desired (most commands have @commands.guild_only() anyway)
+    # 2. Ignore DMs if desired
     # if not message.guild:
+    #     logger.debug(f"Message {message.id} ignored: DM channel.")
     #     return
 
     # 3. Perform custom logic checks *before* command processing
     user_id = str(message.author.id) # Use string IDs
-    content_lower = message.content.lower().strip()
+    content_lower = message.content.lower().strip() if message.content else "" # Handle potential empty content
+    logger.debug(f"Message {message.id} content (lower): '{content_lower[:50]}...'") # Log content
 
     # --- Math Help Mode Activation ---
-    # Check triggers only if user is NOT currently answering a math quest
-    # AND the message doesn't look like a command already
-    # (Using get_context early helps check if it's potentially a command)
     ctx_check = await bot.get_context(message)
-    # Use `bot.math_help_triggers.intersection(content_lower.split())` for word-based trigger checks?
-    # Sticking to `any` for substring check for simplicity for now.
-    if not ctx_check.valid and user_id not in bot.math_answers and \
-       any(trigger in content_lower for trigger in bot.math_help_triggers):
+    logger.debug(f"Message {message.id}: ctx_check.valid = {ctx_check.valid}, command = {ctx_check.command}") # Check command validity
+
+    is_math_help_trigger = any(trigger in content_lower for trigger in bot.math_help_triggers) if content_lower else False
+    user_in_math_answers = user_id in bot.math_answers
+    logger.debug(f"Message {message.id}: is_math_help_trigger = {is_math_help_trigger}, user_in_math_answers = {user_in_math_answers}")
+
+    if not ctx_check.valid and not user_in_math_answers and is_math_help_trigger:
+        logger.debug(f"Message {message.id}: Entering Math Help Activation block.")
         # Check if already in math help mode
         if user_id in bot.conversation_states and bot.conversation_states[user_id].get("mode") == "math_help":
-             # Don't send message if already in mode, just ignore trigger
-             # await message.channel.send(embed=create_embed(...))
+             logger.debug(f"Message {message.id}: User already in help mode.")
+             # Don't send message, just ignore
              return # Already in mode, handled. Stop command processing.
 
         # Enter math help mode
@@ -1463,7 +1475,9 @@ async def on_message(message: discord.Message): # Add type hint
 
     # --- Handle Messages While in Math Help Mode ---
     if user_id in bot.conversation_states and bot.conversation_states[user_id].get("mode") == "math_help":
+        logger.debug(f"Message {message.id}: Entering Math Help Response block.")
         if content_lower in ["cancel", "stop", "done", "exit"]:
+            logger.debug(f"Message {message.id}: Detected help mode cancel word.")
             del bot.conversation_states[user_id] # Exit math help mode
             logger.info(f"User {user_id} ({message.author.name}) exited math help mode.")
             await message.channel.send(embed=create_embed(
@@ -1474,14 +1488,14 @@ async def on_message(message: discord.Message): # Add type hint
             return # Exited help mode, handled. Stop command processing.
 
         # If not a cancel command, treat it as math problem
-        logger.debug(f"Math help mode: User {user_id} sent problem: {message.content}")
+        logger.debug(f"Message {message.id}: Treating as math problem in help mode.")
         # Use a helper that invokes the !solve command correctly
         await solve_math_question_from_help(message)
         return # Problem sent to solver, handled. Stop command processing.
 
     # --- Handle Math Quest Answers ---
-    # Check only if user has an active question AND is not in another conversation mode
     if user_id in bot.math_answers and user_id not in bot.conversation_states:
+        logger.debug(f"Message {message.id}: Entering Math Quest Answer block.")
         question_data = bot.math_answers[user_id]
         expected_answer = question_data["answer"]
         question_text = question_data["question"]
@@ -1489,6 +1503,7 @@ async def on_message(message: discord.Message): # Add type hint
 
         # Use the improved answer checking function
         is_correct = is_answer_correct(message.content, expected_answer)
+        logger.debug(f"Message {message.id}: Math quest answer check. Correct: {is_correct}")
 
         # --- Correct Answer ---
         if is_correct:
@@ -1545,12 +1560,15 @@ async def on_message(message: discord.Message): # Add type hint
         return # IMPORTANT: Math quest answer handled. Stop further processing (incl. command processing).
 
     # 4. If none of the custom logic handlers returned, do nothing here.
-    #    discord.py will automatically process the message for commands
-    #    if it starts with the prefix. Log messages that fall through.
-    if not ctx_check.valid: # Log only if it wasn't recognized as a command attempt initially
-         logger.debug(f"Ignoring non-command/non-interactive message from {user_id}: {message.content[:50]}...")
+    if not ctx_check.valid:
+         logger.debug(f"Message {message.id}: Ignoring non-command/non-interactive message.")
+    else:
+         # This case should ideally not be reached if ctx_check.valid was handled implicitly
+         # If it *is* reached, it means discord.py's command processing will run.
+         logger.debug(f"Message {message.id}: Potentially passing to default command processor (ctx was valid initially).")
 
-    # DO NOT explicitly call bot.process_commands(message) here.
+    # --- END OF on_message FUNCTION ---
+    # No explicit bot.process_commands needed
 
 
 async def solve_math_question_from_help(message: discord.Message):
@@ -1568,8 +1586,11 @@ async def solve_math_question_from_help(message: discord.Message):
             if OPENAI_API_KEY: # Check if AI is enabled
                  # Use invoke to properly handle checks, cooldowns, and error handling
                  # This will also trigger on_command_error if solve raises an error
+                 logger.debug(f"Invoking !solve for help mode. Problem: {message.content[:50]}...")
                  await ctx.invoke(solve_command, problem=message.content)
+                 logger.debug(f"!solve invocation complete for help mode.")
             else:
+                 logger.warning("Attempted help mode solve, but OpenAI key is missing.")
                  await ctx.send(embed=create_embed(
                      title="❌ AI Feature Disabled",
                      description="The OpenAI API key is not configured. Cannot solve automatically in help mode.",
@@ -1581,7 +1602,7 @@ async def solve_math_question_from_help(message: discord.Message):
     # Let on_command_error handle errors raised by ctx.invoke
     except commands.CommandInvokeError as e:
          # If invoke causes an error, let on_command_error handle it
-         logger.debug(f"CommandInvokeError during help mode solve: {e.original}")
+         logger.warning(f"CommandInvokeError during help mode solve: {e.original}")
          # on_command_error should catch the original error
     except Exception as e:
         # Catch errors during context creation or command finding *before* invoke
@@ -1731,7 +1752,9 @@ async def main():
              exit(1) # Use exit() here as we are not in the main async loop yet
 
         # Start the bot - this is blocking until the bot stops
-        await bot.start(DISCORD_TOKEN)
+        # Recommended way to run the bot within an async context
+        async with bot:
+            await bot.start(DISCORD_TOKEN)
 
     except discord.errors.LoginFailure:
         logger.critical("❌ Invalid Discord Token - Authentication failed.")
