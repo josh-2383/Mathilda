@@ -2,17 +2,15 @@
 # exit on error
 set -o errexit
 
-echo "--- Installing Python Dependencies ---"
+echo "Starting build script..."
+
+# Update package list and install Tesseract OCR engine + English language pack
+# Add other languages if needed e.g., tesseract-ocr-fra for French
+echo "Installing Tesseract OCR..."
+apt-get update && apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng
+
+# Install Python dependencies from requirements.txt
+echo "Installing Python packages..."
 pip install -r requirements.txt
 
-echo "--- Installing Tesseract OCR ---"
-apt-get update # Update package list
-# Install tesseract and the English language pack (-y accepts prompts automatically)
-apt-get install -y tesseract-ocr tesseract-ocr-eng
-# Add other language packs if needed, e.g., tesseract-ocr-spa for Spanish:
-# apt-get install -y tesseract-ocr-spa tesseract-ocr-fra ...
-
-# Optional: Clean up apt cache to reduce slug size
-apt-get clean && rm -rf /var/lib/apt/lists/*
-
-echo "--- Build Complete ---"
+echo "Build script finished successfully!"
