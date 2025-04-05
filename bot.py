@@ -18,6 +18,276 @@ import math # Added for float comparison tolerance
 # --- OCR Imports ---
 import pytesseract
 from PIL import Image # Pillow library
+import io          # To handle image bytes
+import requests      # To download image if needed
+import functools     # For running blocking code in executor
+
+# --- Voice Imports ---
+import speech_recognition as sr # Speech recognition library
+import wave          # For handling WAV audio format (built-in)
+# Ensure PyNaCl is installed: pip install PyNaCl
+# --------------------
+
+# ======================
+# LOGGING SETUP
+# ======================
+log_level = getattr(logging, os.environ.get('LOG_LEVEL', 'INFO').upper(), logging.INFO)
+logging.basicConfig(level=log_level, format='%(asctime)s:%(levelname)s:%(name)s: %(message)s')
+logging.getLogger('discord.http').setLevel(logging.WARNING)
+logging.getLogger('PIL').setLevel(logging.WARNING)
+logging.getLogger('werkzeug').setLevel(logging.WARNING)
+logging.getLogger('speech_recognition').setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
+
+# ======================
+# ENVIRONMENT VARIABLES & REQUIREMENTS
+# ======================
+# discord.py>=2.0.0
+# openai>=1.0.0
+# sympy
+# Flask
+# python-dotenv
+# Pillow
+# pytesseract
+# requests
+# PyNaCl          # <--- ADD for Voice
+# SpeechRecognition # <--- ADD for Voice
+# waitress / gunicorn (Recommended for Flask production)
+
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+if not DISCORD_TOKEN:
+    logger.critical("❌ FATAL ERROR: Missing DISCORD_TOKEN environment variable")
+    exit(1)
+if not OPENAI_API_KEY:
+    logger.warning("⚠️ WARNING: Missing OPENAI_API_KEY environment variable. !solve and !ocr true commands will not work.")
+else:
+    # Initialize OpenAI client if key exists
+    try:
+        openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+        logger.info("OpenAI client initialized.")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize OpenAI client: {e}", exc_info=True)
+        openai_client = None # Ensure it's None if init fails
+        OPENAI_API_KEY = None # Treat as if key is missing
+
+# ======================
+# DATABASE SETUP / INIT
+# ======================
+DB_NAME = 'mathilda.db'
+
+def init_database():
+    """Initialize database with all required tables and columns"""
+    conn = None # Define conn outside try block
+    try:
+        logger.info(f"Connecting to database: {DB_NAME}")
+        conn = sqlite3.connect(DB_NAME, timeout=10)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys = ON")
+        cursor = conn.cursor()
+        logger.info("Attempting to initialize database tables...")
+
+        # Use TEXT primary key for user_id for better Discord ID compatibility
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS leaderboard (
+            user_id TEXT PRIMARY KEY,
+            points INTEGER DEFAULT 0,
+            highest_streak INTEGER DEFAULT 0,
+            total_correct INTEGER DEFAULT 0,
+            last_active TEXT
+        )""")
+        logger.debug("Checked/Created leaderboard table.")
+
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS question_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT,
+            question TEXT,
+            answer TEXT,
+            was_correct BOOLEAN,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )""")
+        logger.debug("Checked/Created question_history table.")
+
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS corrections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wrong TEXT UNIQUE, -- Ensure 'wrong' term is unique (case-insensitive handled by code)
+            correct TEXT,
+            added_by TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )""")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_corrections_wrong_lower ON corrections (LOWER(wrong))")
+        logger.debug("Checked/Created corrections table and index.")
+
+        # --- Schema Migration: Add missing columns robustly ---
+        logger.debug("Checking for missing columns in leaderboard...")
+        table_info = cursor.execute("PRAGMA table_info(leaderboard)").fetchall()
+        columns = [col[1].lower() for col in table_info]
+
+        if 'highest_streak' not in columns:
+            cursor.execute("ALTER TABLE leaderboard ADD COLUMN highest_streak INTEGER DEFAULT 0")
+            logger.info("Added missing column 'highest_streak' to leaderboard.")
+        if 'total_correct' not in columns:
+            cursor.execute("ALTER TABLE leaderboard ADD COLUMN total_correct INTEGER DEFAULT 0")
+            logger.info("Added missing column 'total_correct' to leaderboard.")
+        if 'last_active' not in columns:
+            cursor.execute("ALTER TABLE leaderboard ADD COLUMN last_active TEXT")
+            logger.info("Added missing column 'last_active' to leaderboard.")
+
+        conn.commit()
+        logger.info("✅ Database initialized successfully")
+        conn.close()
+        return True
+    except sqlite3.Error as e:
+        logger.error(f"❌ Database initialization/migration failed: {e}", exc_info=True)
+        if conn:
+            conn.rollback()
+            conn.close()
+        raise
+
+# --- Initialize DB on startup ---
+try:
+    init_database()
+except Exception as db_init_err:
+    logger.critical(f"❌ Halting execution due to database initialization failure: {db_init_err}")
+    exit(1)
+# ---------------------------------
+
+# ======================
+# FLASK WEB SERVER (Required for Render Web Service Port Binding)
+# ======================
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return f"Mathilda Discord Bot is running! ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})"
+
+def run_flask():
+    port = int(os.environ.get('PORT', 8080))
+    host = "0.0.0.0"
+    try:
+        # Using Waitress for production - add 'waitress' to requirements.txt
+        from waitress import serve
+        logger.info(f"Starting Waitress server on {host}:{port}")
+        serve(app, host=host, port=port, threads=6) # Use Waitress
+
+        # Fallback to Flask Dev Server (Not for production!)
+        # logger.info(f"Starting Flask development server on {host}:{port}")
+        # app.run(host=host, port=port, debug=False, use_reloader=False)
+
+    except ImportError:
+        logger.warning("Waitress not found. Falling back to Flask development server (NOT recommended for production).")
+        logger.warning("Install Waitress: pip install waitress")
+        logger.info(f"Starting Flask development server on {host}:{port}")
+        app.run(host=host, port=port, debug=False, use_reloader=False)
+    except Exception as e:
+        logger.error(f"❌ Flask server failed to start or crashed: {e}", exc_info=True)
+
+flask_thread = threading.Thread(target=run_flask, daemon=True)
+flask_thread.name = "FlaskServerThread"
+flask_thread.start()
+logger.info("Flask server thread started to handle web service requests.")
+# --------------------------------------------------------------------------
+
+# ======================
+# DISCORD BOT SETUP
+# ======================
+intents = discord.Intents.default()
+intents.message_content = True # REQUIRED for reading message content
+intents.members = True # REQUIRED for reliable member lookups - Enable in Developer Portal!
+intents.voice_states = True # REQUIRED FOR VOICE STATE CHANGES
+
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents,
+    help_command=commands.DefaultHelpCommand(no_category='Commands'),
+    activity=discord.Game(name="!help | Math Time!"),
+    case_insensitive=True
+)
+
+# Bot state management (in-memory)
+bot.math_answers = {} # Stores current math quest {user_id: {"question": str, "answer": str, "streak": int, "message_id": int}}
+bot.question_streaks = {} # Stores current streak {user_id: int} - might sync with DB value on first quest
+bot.conversation_states = {} # Stores dicts: {user_id: {"mode": "math_help"}} # Example
+# bot.voice_clients = {} # Store active voice clients {guild_id: discord.VoiceClient} <- REMOVED
+bot.listening_info = {} # Store info needed during listening {guild_id: {"text_channel": discord.TextChannel, "sink": ...}}
+
+# Math help triggers (lowercase set for faster lookups)
+bot.math_help_triggers = {
+    "help with math", "math question", "solve this", "how to calculate",
+    "math help", "solve for", "how do i solve", "calculate", "math problem"
+}
+
+# ======================
+# MATH QUESTION DATABASE (Consider moving to DB or JSON)
+# ======================
+math_questions = {
+    # Basic Arithmetic
+    "What is 2 + 2?": "4",
+    "What is 15 - 7?": "8",
+    "What is 6 × 9?": "54",
+    "What is 144 ÷ 12?": "12",
+    "What is 3^4?": "81",
+    "What is √144?": "12 or sqrt(144)",
+    "What is 5! (factorial)?": "120",
+    "What is 15% of 200?": "30 or 30.0",
+    "What is 0.25 as a fraction?": "1/4",
+    "What is 3/4 + 1/2?": "5/4 or 1.25 or 1 1/4",
+    "What is 2^10?": "1024",
+    "What is the next prime number after 7?": "11",
+    "What is 1.5 × 2.5?": "3.75",
+    "What is 1000 ÷ 8?": "125",
+    "What is 17 × 3?": "51",
+
+    # Algebra
+    "Solve for x: 3x + 5 = 20": "5 or x=5",
+    "Factor x² - 9": "(x+3)(x-3) or (x-3)(x+3)", # Sympy handles order
+    "Simplify 2(x + 3) + 4x": "6*x + 6", # Use * explicitly
+    "Solve for y: 2y - 7 = 15": "11 or y=11",
+    "Expand (x + 2)(x - 3)": "x**2 - x - 6", # Use ** for sympy
+    "What is the slope of the line y = 2x + 5?": "2",
+    "Solve the system: x + y = 5, x - y = 1": "x=3, y=2 or (3, 2) or y=2, x=3",
+    "Simplify (x³ * x⁵) / x²": "x**6",
+    "Solve the quadratic: x² - 5x + 6 = 0": "x=2, x=3 or x=3, x=2 or 2, 3 or 3, 2",
+    "What is the vertex of the parabola y = x² - 4x + 3?": "(2, -1)",
+
+    # Geometry (using approx values, consider accepting ranges or pi symbol)
+    "Area of a circle with radius 5 (use pi ≈ 3.14159)": "78.54", # Tolerant float compare needed
+    "Circumference of a circle with diameter 10 (use pi ≈ 3.14159)": "31.42", # Tolerant float compare needed
+    "Volume of a cube with side length 3": "27",
+    "Length of the hypotenuse for a right triangle with legs 3 and 4": "5", # Rephrased pythagorean
+    "Sum of interior angles of a hexagon (in degrees)": "720",
+    "Area of a triangle with base 6 and height 4": "12",
+    "Surface area of a sphere with radius 2 (use pi ≈ 3.14159)": "50.27", # Tolerant float compare needed
+    "Volume of a cylinder with radius 3 and height 5 (use pi ≈ 3.14159)": "141.37", # Tolerant float compare needed
+    "Length of the diagonal of a 5 by 12 rectangle": "13",
+    "Measure of one exterior angle of a regular octagon (in degrees)": "45",
+
+    # Calculus
+    "Derivative of x³ with respect to x": "3*x**2",
+    "Integral of 2x dx": "x**2", # Ignoring + C for simplicity
+    "Derivative of sin(x) with respect to x": "cos(x)",
+    "Limit as x approaches 0 of (sin x)/x": "1",# -*- coding: utf-8 -*- # Added for potential unicode characters in OCR
+import discord
+from discord.ext import commands
+import sqlite3
+import openai
+import os
+import random
+import sympy as sp
+from flask import Flask
+import threading
+from discord import Embed, Color
+import asyncio
+from datetime import datetime
+import time
+import logging
+import math # Added for float comparison tolerance
+
+# --- OCR Imports ---
+import pytesseract
+from PIL import Image # Pillow library
 import io           # To handle image bytes
 import requests     # To download image if needed
 import functools    # For running blocking code in executor
